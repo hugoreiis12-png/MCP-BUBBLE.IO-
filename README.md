@@ -1,4 +1,4 @@
-# Bubble Bridge 0.2
+# Bubble Bridge 0.3
 
 Servidor MCP + CLI em Node/TypeScript que liga o OpenCode (ou Claude Code) a um app Bubble.io usando só caminhos oficiais:
 
@@ -50,17 +50,20 @@ No editor do Bubble (Settings > API): habilite a Data API para os tipos desejado
 | Tool | Modo mínimo | Endpoint |
 | --- | --- | --- |
 | `bubble_config` | read-only | — |
-| `bubble_schema_discover` | read-only | `/meta/swagger.json`, `/meta` |
-| `bubble_data_query` | read-only | `GET /obj/{type}` |
-| `bubble_data_get` | read-only | `GET /obj/{type}/{id}` |
+| `bubble_schema` | read-only | `/meta/swagger.json` em fatias: `list_types`, `get_type`, `list_workflows`, `get_workflow` |
+| `bubble_query` | read-only | `GET /obj/{type}` — `action`: `list` (página, com projeção `fields`), `count` (total em 1 requisição), `get` (por id) |
 | `bubble_data_export` | read-only | `GET /obj/{type}` paginado → NDJSON |
 | `bubble_data_create` | read-write | `POST /obj/{type}` |
 | `bubble_data_bulk_create` | read-write | `POST /obj/{type}/bulk` em lotes |
 | `bubble_data_update` | read-write | `PATCH /obj/{type}/{id}` |
 | `bubble_workflow_run` | read-write | `POST /wf/{name}` (só allowlist) |
+| `bubble_workflow_run_many` | read-write | `POST /wf/{name}` até 50 disparos com um plan_id; para no 1º erro |
+| `bubble_workflow_create` | read-write | `POST /obj/{type}` + `POST /wf/{name}` no mesmo plan_id (o workflow já deve existir no app) |
 | `bubble_data_delete` | admin | snapshot + `DELETE /obj/{type}/{id}` |
 | `bubble_exposure_audit` | read-only | GET **sem token** em N tipos → quais vazam, com gravidade |
 | `bubble_anonymous_read` | read-only | PoC: GET sem token em 1 tipo |
+
+Respostas valem `structuredContent` + texto compacto; **teto de 16 KB por resposta** (arrays grandes são cortados e marcados `_truncated`) e **fila de 6 chamadas em voo** para não rajada na Data API. As tools `bubble_data_query`, `bubble_data_get` e `bubble_schema_discover` da v0.2 foram substituídas por `bubble_query` e `bubble_schema`.
 
 ### Como uma escrita acontece
 
