@@ -4,6 +4,8 @@ import { dirname } from "node:path";
 export interface AuditEntry {
   tool: string;
   env: string;
+  /** Nome do client remoto que chamou (transporte HTTP). */
+  client?: string;
   /** Tipo, workflow ou recurso alvo — nunca o token. */
   target?: string;
   ok: boolean;

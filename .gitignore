@@ -6,3 +6,4 @@ logs/
 *.bubble
 bubble-types.ts
 build/
+clients.json

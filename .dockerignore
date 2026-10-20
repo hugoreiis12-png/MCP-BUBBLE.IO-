@@ -1,0 +1,20 @@
+# Nada de dados, segredos ou artefatos locais na imagem (exports/ tem dados pessoais).
+.git
+.env
+.env.*
+!.env.example
+node_modules
+dist
+exports
+logs
+build
+test
+elements
+docs
+deploy
+*.bubble
+bubble-types.ts
+DER.mmd
+security_audits
+security_config.json
+*.md

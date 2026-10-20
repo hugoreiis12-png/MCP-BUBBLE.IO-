@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { serveHttp, type HttpServerHandle } from "../src/mcp/http.js";
 import { createBubbleMcpServer } from "../src/mcp/server.js";
 import { loadConfig } from "../src/config.js";
+import { staticTokenAuth } from "../src/core/clients.js";
 import { BubbleClient } from "../src/core/client.js";
 import { fakeBubble, makeRows } from "./fake-bubble.js";
 
@@ -33,7 +34,7 @@ afterAll(async () => {
 
 describe("transporte HTTP autenticado", () => {
   it("recusa sem token, aceita com token e responde initialize/tools/list", async () => {
-    handle = await serveHttp({ host: "127.0.0.1", port: 0, token: TOKEN, factory, ratePerMin: 0 });
+    handle = await serveHttp({ host: "127.0.0.1", port: 0, authenticate: staticTokenAuth(TOKEN, "read-only"), factory, ratePerMin: 0 });
     const url = handle.url;
 
     expect((await fetch(url, { method: "POST", body: "{}" })).status).toBe(401);
@@ -61,7 +62,7 @@ describe("transporte HTTP autenticado", () => {
   });
 
   it("corta com 429 quando o IP estoura a cota por minuto", async () => {
-    const limited = await serveHttp({ host: "127.0.0.1", port: 0, token: TOKEN, factory, ratePerMin: 2 });
+    const limited = await serveHttp({ host: "127.0.0.1", port: 0, authenticate: staticTokenAuth(TOKEN, "read-only"), factory, ratePerMin: 2 });
     try {
       const codes: number[] = [];
       for (let i = 0; i < 4; i++) codes.push((await rpc(limited.url, TOKEN, "tools/list", {})).status);

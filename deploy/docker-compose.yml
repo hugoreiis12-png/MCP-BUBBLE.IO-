@@ -1,0 +1,44 @@
+# Stack do Portainer: Bubble Bridge como MCP remoto, só para a rede interna.
+# Portainer → Stacks → Add stack → Repository (compose path: deploy/docker-compose.yml)
+# ou Web editor colando este arquivo com a imagem já construída.
+# Variáveis (Portainer → Environment variables): ver deploy/stack.env.example.
+services:
+  bridge:
+    image: bubble-bridge:${BRIDGE_VERSION:-0.4.0}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # 8787 no host, publicada só no IP da VM na rede interna (obrigatório: sem ele a stack não sobe).
+      - "${BRIDGE_BIND_IP:?defina BRIDGE_BIND_IP com o IP interno da VM}:8787:8787"
+    environment:
+      BUBBLE_APP_URL: ${BUBBLE_APP_URL:?defina BUBBLE_APP_URL}
+      BUBBLE_API_TOKEN: ${BUBBLE_API_TOKEN:-}
+      BUBBLE_ENV: ${BUBBLE_ENV:-test}
+      BUBBLE_MODE: ${BUBBLE_MODE:-read-only}
+      BUBBLE_ALLOW_LIVE_WRITES: ${BUBBLE_ALLOW_LIVE_WRITES:-false}
+      BUBBLE_WORKFLOW_ALLOWLIST: ${BUBBLE_WORKFLOW_ALLOWLIST:-}
+      BUBBLE_SEARCH_CAP: ${BUBBLE_SEARCH_CAP:-50000}
+      BUBBLE_BRIDGE_ALLOWED_ORIGINS: ${BUBBLE_BRIDGE_ALLOWED_ORIGINS:-}
+    volumes:
+      - bridge-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bridge-data:

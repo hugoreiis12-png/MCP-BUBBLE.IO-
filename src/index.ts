@@ -11,3 +11,7 @@ export { generateTypes } from "./core/codegen.js";
 export { AuditLog } from "./core/audit.js";
 export { createBubbleMcpServer } from "./mcp/server.js";
 export { serveHttp } from "./mcp/http.js";
+export { startRemote } from "./mcp/remote.js";
+export { createSharedState, type SharedState } from "./mcp/server.js";
+export { ClientRegistry, staticTokenAuth, effectiveMode, hashToken, addClient, revokeClient, listClients } from "./core/clients.js";
+export type { Authenticator, ClientIdentity, ClientRecord } from "./core/clients.js";

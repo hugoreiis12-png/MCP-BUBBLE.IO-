@@ -3,6 +3,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { modeRank, redactedConfig, type BridgeConfig, type BubbleEnv, type Mode } from "../config.js";
 import { AuditLog } from "../core/audit.js";
+import { effectiveMode, type ClientIdentity } from "../core/clients.js";
 import { BULK_MAX, BubbleClient, CONSTRAINT_TYPES, MAX_PAGE_LIMIT, apiRootFor } from "../core/client.js";
 import { SENSITIVE_TYPE_RE, probeAnonymous, sweepAnonymous } from "../core/recon.js";
 import {
@@ -20,7 +21,7 @@ import { exportToNdjson } from "../core/files.js";
 import { normalizeSwagger } from "../core/schema.js";
 
 export const SERVER_NAME = "bubble-bridge";
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 
 /** Teto de bytes por resposta (mensagem JSON-RPC compacta evita truncamento do transporte). */
 export const MAX_OUTPUT_CHARS = 16_000;
@@ -107,33 +108,49 @@ const constraintSchema = z.object({
   value: z.unknown().optional(),
 });
 
+/** Estado que sobrevive entre requisições HTTP (o McpServer é recriado a cada uma). */
+export interface SharedState {
+  limiter: InflightLimiter;
+  swagger: { value: unknown; at: number };
+}
+
+export function createSharedState(): SharedState {
+  return { limiter: new InflightLimiter(MAX_INFLIGHT), swagger: { value: null, at: 0 } };
+}
+
+const SWAGGER_TTL_MS = 60_000;
+
 export interface ServerDeps {
   config: BridgeConfig;
   client: BubbleClient;
   audit?: AuditLog;
+  shared?: SharedState;
+  /** Client remoto autenticado: o modo efetivo é o menor entre o dele e o do servidor. */
+  identity?: ClientIdentity;
 }
 
 interface ToolSpec {
   name: string;
   minMode: Mode;
+  /** Tool que grava no disco do servidor: inútil para client remoto. */
+  localOnly?: boolean;
   register: (server: McpServer) => void;
 }
 
 /** Cria o servidor MCP com as tools permitidas pelo modo configurado. */
 export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; tools: string[] } {
-  const { config, client } = deps;
+  const { config, client, identity } = deps;
   const audit = deps.audit ?? new AuditLog(config.auditLog);
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  const limiter = new InflightLimiter(MAX_INFLIGHT);
+  const { limiter, swagger } = deps.shared ?? createSharedState();
+  const mode = identity ? effectiveMode(identity.mode, config.mode) : config.mode;
 
   /** Cache de 60 s do swagger: evitar refetch de ~500 KB em fatias seguidas de bubble_schema. */
-  let swaggerCache: unknown = null;
-  let swaggerAt = 0;
   async function swaggerCached(): Promise<unknown> {
-    if (swaggerCache && Date.now() - swaggerAt < 60_000) return swaggerCache;
-    swaggerCache = await client.swagger();
-    swaggerAt = Date.now();
-    return swaggerCache;
+    if (swagger.value && Date.now() - swagger.at < SWAGGER_TTL_MS) return swagger.value;
+    swagger.value = await client.swagger();
+    swagger.at = Date.now();
+    return swagger.value;
   }
 
   async function run(
@@ -144,7 +161,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
     const started = Date.now();
     try {
       const { data, items, untrusted = true, planId: pid, dryRun } = await limiter.run(fn);
-      await audit.write({ tool, env: client.env, target, ok: true, ms: Date.now() - started, items, planId: pid, dryRun });
+      await audit.write({ tool, env: client.env, client: identity?.name, target, ok: true, ms: Date.now() - started, items, planId: pid, dryRun });
       const { value, truncated } = fitToCap(data as Record<string, unknown>);
       const compact = JSON.stringify(value);
       return {
@@ -153,7 +170,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
       };
     } catch (err) {
       const envd = errorEnvelope(err);
-      await audit.write({ tool, env: client.env, target, ok: false, ms: Date.now() - started, error: envd.message });
+      await audit.write({ tool, env: client.env, client: identity?.name, target, ok: false, ms: Date.now() - started, error: envd.message });
       return {
         isError: true,
         content: [{ type: "text", text: envd.message }],
@@ -228,7 +245,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
           },
           async () =>
             run("bubble_config", undefined, async () => ({
-              data: { ...redactedConfig(config), apiRoot: client.apiRoot, tools: registered },
+              data: { ...redactedConfig(config), mode, client: identity?.name ?? "local", apiRoot: client.apiRoot, tools: registered },
               untrusted: false,
             })),
         ),
@@ -353,6 +370,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
     {
       name: "bubble_data_export",
       minMode: "read-only",
+      localOnly: true,
       register: (s) =>
         s.registerTool(
           "bubble_data_export",
@@ -760,7 +778,8 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
 
   const registered: string[] = [];
   for (const spec of specs) {
-    if (modeRank(config.mode) >= modeRank(spec.minMode)) {
+    if (spec.localOnly && identity) continue;
+    if (modeRank(mode) >= modeRank(spec.minMode)) {
       spec.register(server);
       registered.push(spec.name);
     }

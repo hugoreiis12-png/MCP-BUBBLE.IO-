@@ -48,6 +48,23 @@ const ConfigSchema = z.object({
   httpToken: z.string().min(16).optional(),
   httpHost: z.string().default("127.0.0.1"),
   httpPort: z.coerce.number().int().min(1024).max(65535).default(8787),
+  /** Arquivo de clients (token por client). Tem precedência sobre httpToken. */
+  clientsFile: z.string().optional(),
+  /** Só true atrás de proxy confiável: o IP do rate limit vem do X-Forwarded-For. */
+  trustProxy: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Origins de navegador aceitos no /mcp. Vazio = qualquer Origin presente é recusado. */
+  allowedOrigins: z
+    .string()
+    .default("")
+    .transform((s) =>
+      s
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean),
+    ),
 });
 
 export type BridgeConfig = z.infer<typeof ConfigSchema>;
@@ -80,6 +97,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     httpToken: env.BUBBLE_BRIDGE_HTTP_TOKEN || undefined,
     httpHost: env.BUBBLE_BRIDGE_HTTP_HOST || undefined,
     httpPort: env.BUBBLE_BRIDGE_HTTP_PORT || undefined,
+    clientsFile: env.BUBBLE_BRIDGE_CLIENTS_FILE || undefined,
+    trustProxy: env.BUBBLE_BRIDGE_TRUST_PROXY || undefined,
+    allowedOrigins: env.BUBBLE_BRIDGE_ALLOWED_ORIGINS || undefined,
   });
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `- ${i.path.join(".")}: ${i.message}`).join("\n");
@@ -105,5 +125,8 @@ export function redactedConfig(cfg: BridgeConfig): Record<string, unknown> {
     http: cfg.httpToken ? `token definido (${cfg.httpToken.length} caracteres)` : "desligado (serve --http recusa sem token)",
     httpHost: cfg.httpHost,
     httpPort: cfg.httpPort,
+    clientsFile: cfg.clientsFile ?? "desligado",
+    trustProxy: cfg.trustProxy,
+    allowedOrigins: cfg.allowedOrigins,
   };
 }
