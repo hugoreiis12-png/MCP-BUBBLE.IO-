@@ -1,4 +1,4 @@
-# Bubble Bridge 0.3
+# Bubble Bridge 0.4
 
 Servidor MCP + CLI em Node/TypeScript que liga o OpenCode (ou Claude Code) a um app Bubble.io usando só caminhos oficiais:
 
@@ -159,20 +159,22 @@ primeiro; não substitui a análise manual das privacy rules.
 
 ## Servir por HTTP (execução remota)
 
-O `serve` padrão é stdio. Para chamada remota, o transporte Streamable HTTP fica disponível —
-**exigindo um bearer próprio**, porque o servidor carrega o `BUBBLE_API_TOKEN`:
+O `serve` padrão é stdio. Para vários clients consumirem um servidor só, use o transporte
+Streamable HTTP com **um token por client**. O deploy em stack do Portainer, na rede interna,
+está em [`docs/deploy.md`](docs/deploy.md).
 
 ```bash
-export BUBBLE_BRIDGE_HTTP_TOKEN="$(openssl rand -hex 32)"
-node dist/cli.js serve --http --port 8787          # bind 127.0.0.1 por padrão
-node dist/cli.js serve --http --host 0.0.0.0       # exposto: exige TLS e rede privada na frente
+export BUBBLE_BRIDGE_CLIENTS_FILE=./clients.json
+node dist/cli.js clients add hugo --mode read-write   # imprime o token uma vez; o arquivo guarda o sha256
+node dist/cli.js serve --http --port 8787             # bind 127.0.0.1 por padrão
 ```
 
-- comparação de token em tempo constante, `401` sem/wrong bearer;
-- modo stateless (sem estado entre requisições), corpo limitado a 8 MB, 32 requisições em voo,
-  120 req/min por IP;
-- `GET /healthz` público, sem dados;
-- cliente: `"mcp": {"bubble": {"type": "remote", "url": "http://127.0.0.1:8787/mcp"}}`.
+- Modo efetivo do client = `min(modo do client, BUBBLE_MODE)`; `clients revoke` vale sem restart.
+- `BUBBLE_BRIDGE_HTTP_TOKEN` (token único) continua aceito quando não há arquivo de clients: vira o client `default`.
+- A auditoria registra o nome do client; `bubble_data_export` só existe no stdio.
+- Stateless, com corpo limitado a 8 MB, 32 requisições em voo e 120 req/min por IP e por client.
+  Também recusa `Origin` fora de `BUBBLE_BRIDGE_ALLOWED_ORIGINS` e encerra limpo em SIGTERM.
+- `GET /healthz` é público e não devolve dados.
 
 ## Notas da fusão (v0.1 + v0.2)
 
@@ -182,7 +184,7 @@ node dist/cli.js serve --http --host 0.0.0.0       # exposto: exige TLS e rede p
 ## Testes
 
 ```bash
-npm test           # 51 testes: http, cliente, export, escrita, MCP, build e runtime de elementos em jsdom
+npm test           # 117 testes: http, cliente, export, escrita, MCP, build e runtime de elementos em jsdom
 npm run typecheck  # código, testes e elementos
 ```
 

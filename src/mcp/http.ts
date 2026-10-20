@@ -1,29 +1,33 @@
-import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Authenticator, ClientIdentity } from "../core/clients.js";
 
 /**
  * Transporte remoto do Bubble Bridge (MCP Streamable HTTP, modo stateless).
  *
  * Por que não expor o stdio na internet: o servidor carrega o BUBBLE_API_TOKEN.
  * Publicá-lo sem autenticação transformaria o seu token admin em API da internet.
- * Por isso o token HTTP é obrigatório, comparação é constant-time e o bind padrão
- * é loopback — para uso real, coloque um reverse proxy com TLS na frente.
+ * Por isso todo /mcp exige bearer de um client cadastrado (hash comparado em tempo
+ * constante) e o bind padrão é loopback.
  */
 
 export interface HttpServeOptions {
   host: string;
   port: number;
-  /** Bearer obrigatório. Recusa o start sem ele. */
-  token: string;
-  /** Cria um McpServer novo por requisição (exigência do modo stateless). */
-  factory: () => { server: McpServer; tools: string[] };
+  /** Resolve o bearer para um client; null vira 401. */
+  authenticate: Authenticator;
+  /** Cria um McpServer novo por requisição (exigência do modo stateless), já no modo do client. */
+  factory: (identity: ClientIdentity) => { server: McpServer; tools: string[] };
   log?: (msg: string) => void;
   maxBodyBytes?: number;
   maxInflight?: number;
-  /** Requisições por minuto por IP. 0 desliga. */
+  /** Requisições por minuto, por IP (antes da auth) e por client (depois). 0 desliga. */
   ratePerMin?: number;
+  /** Atrás de proxy confiável: IP do rate limit vem do último hop do X-Forwarded-For. */
+  trustProxy?: boolean;
+  /** Origins de navegador aceitos. Origin presente e fora da lista = 403 (DNS rebinding). */
+  allowedOrigins?: string[];
 }
 
 const DEFAULT_MAX_BODY = 8 * 1024 * 1024;
@@ -60,16 +64,19 @@ export function serveHttp(opts: HttpServeOptions): Promise<HttpServerHandle> {
       res.end(JSON.stringify({ error: "not_found" }));
       return;
     }
-    if (!rateOk(hits, req.socket.remoteAddress ?? "?", rateLimit)) {
-      res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
-      res.end(JSON.stringify({ error: "rate_limited" }));
+    if (!originAllowed(req, opts.allowedOrigins ?? [])) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "origin_not_allowed" }));
       return;
     }
-    if (!authorized(req, opts.token)) {
+    if (!rateOk(hits, `ip:${clientIp(req, opts.trustProxy ?? false)}`, rateLimit)) return tooMany(res);
+    const identity = identify(req, opts.authenticate);
+    if (!identity) {
       res.writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="bubble-bridge"' });
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
+    if (!rateOk(hits, `client:${identity.name}`, rateLimit)) return tooMany(res);
     if (inflight >= maxInflight) {
       res.writeHead(503, { "content-type": "application/json", "retry-after": "5" });
       res.end(JSON.stringify({ error: "too_many_inflight" }));
@@ -77,14 +84,14 @@ export function serveHttp(opts: HttpServeOptions): Promise<HttpServerHandle> {
     }
     inflight++;
     try {
-      await dispatch(req, res);
+      await dispatch(req, res, identity);
     } finally {
       inflight--;
     }
   }
 
-  async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const { server: mcp, tools } = opts.factory();
+  async function dispatch(req: IncomingMessage, res: ServerResponse, identity: ClientIdentity): Promise<void> {
+    const { server: mcp, tools } = opts.factory(identity);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless: sem estado entre requisições
       enableJsonResponse: true, // request/response simples, sem stream SSE
@@ -98,7 +105,7 @@ export function serveHttp(opts: HttpServeOptions): Promise<HttpServerHandle> {
     const body = method === "POST" ? await readBody(req, res, maxBody) : undefined;
     if (body === undefined && method === "POST") return; // corpo inválido ou vazio: já respondeu
     await transport.handleRequest(req, res, body);
-    log(`${method} /mcp → ${tools.length} tools`);
+    log(`${method} /mcp ${identity.name} → ${tools.length} tools`);
   }
 
   return new Promise((resolve, reject) => {
@@ -109,26 +116,42 @@ export function serveHttp(opts: HttpServeOptions): Promise<HttpServerHandle> {
       const url = `http://${opts.host}:${port}/mcp`;
       log(`MCP remoto em ${url} (autenticado por Bearer; health em /healthz)`);
       if (opts.host !== "127.0.0.1" && opts.host !== "localhost") {
-        log(`ATENÇÃO: bind em ${opts.host} expõe o token do Bubble para a rede — use TLS e rede privada.`);
+        log(`ATENÇÃO: bind em ${opts.host} expõe o servidor para a rede — mantenha-o em rede privada.`);
       }
       resolve({
         url,
         close: () =>
           new Promise<void>((done) => {
             server.close(() => done());
+            server.closeAllConnections();
           }),
       });
     });
   });
 }
 
-function authorized(req: IncomingMessage, expected: string): boolean {
+function identify(req: IncomingMessage, authenticate: Authenticator): ClientIdentity | null {
   const header = req.headers.authorization ?? "";
   const [scheme, value] = header.split(" ");
-  if (scheme?.toLowerCase() !== "bearer" || !value) return false;
-  const a = Buffer.from(value);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  if (scheme?.toLowerCase() !== "bearer" || !value) return null;
+  return authenticate(value);
+}
+
+function originAllowed(req: IncomingMessage, allowed: string[]): boolean {
+  const origin = req.headers.origin;
+  return !origin || allowed.includes(origin);
+}
+
+function clientIp(req: IncomingMessage, trustProxy: boolean): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  const hops = (Array.isArray(forwarded) ? forwarded.join(",") : (forwarded ?? "")).split(",").map((h) => h.trim()).filter(Boolean);
+  if (trustProxy && hops.length) return hops.at(-1)!;
+  return req.socket.remoteAddress ?? "?";
+}
+
+function tooMany(res: ServerResponse): void {
+  res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
+  res.end(JSON.stringify({ error: "rate_limited" }));
 }
 
 /** Janela fixa de 1 minuto por IP. */

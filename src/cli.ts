@@ -9,6 +9,7 @@ import { generateTypes } from "./core/codegen.js";
 import { exportToNdjson } from "./core/files.js";
 import { normalizeSwagger } from "./core/schema.js";
 import { createBubbleMcpServer, SERVER_VERSION } from "./mcp/server.js";
+import { runClients } from "./cli-clients.js";
 
 const HELP = `bubble-bridge ${SERVER_VERSION} — Motor 1 (runtime) + Motor 3 (elementos)
 
@@ -28,7 +29,10 @@ Comandos
   exposure [--all] [--live]     Varre a Data API sem token e classifica a gravidade
   serve --http [--host H] [--port N]
                                 Serve o MCP por HTTP (Streamable HTTP) em vez de stdio.
-                                Exige BUBBLE_BRIDGE_HTTP_TOKEN (openssl rand -hex 32).
+                                Exige BUBBLE_BRIDGE_CLIENTS_FILE ou BUBBLE_BRIDGE_HTTP_TOKEN.
+  clients add <nome> --mode M   Cadastra client remoto e imprime o token (uma única vez)
+  clients list | revoke <nome>  Lista (sem hashes) ou desativa um client
+                                Arquivo: --file ou BUBBLE_BRIDGE_CLIENTS_FILE
 
 Configuração por variáveis de ambiente (ou .env no diretório atual):
   BUBBLE_APP_URL     https://meuapp.bubbleapps.io        (obrigatório)
@@ -94,6 +98,8 @@ async function main(argv: string[]): Promise<number> {
       live: { type: "boolean", default: false },
       all: { type: "boolean", default: false },
       concurrency: { type: "string" },
+      mode: { type: "string" },
+      file: { type: "string" },
     },
     strict: true,
   });
@@ -102,6 +108,8 @@ async function main(argv: string[]): Promise<number> {
     if (!v) throw new Error(`faltou ${flag}`);
     return v;
   };
+
+  if (command === "clients") return runClients(positionals, values.mode, values.file);
 
   // Build de elemento não fala com o app: não exige BUBBLE_APP_URL.
   if (command === "element") {
@@ -131,28 +139,14 @@ async function main(argv: string[]): Promise<number> {
 
   switch (command) {
     case "serve": {
-      const factory = () => createBubbleMcpServer({ config: cfg, client, audit: new AuditLog(cfg.auditLog) });
       if (values.http) {
-        if (!cfg.httpToken) {
-          throw new Error(
-            "serve --http exige BUBBLE_BRIDGE_HTTP_TOKEN (mín. 16 caracteres). " +
-              "Gerar: openssl rand -hex 32. Sem esse token o BUBBLE_API_TOKEN viraria uma API pública.",
-          );
-        }
-        const { serveHttp } = await import("./mcp/http.js");
-        const handle = await serveHttp({
-          host: values.host ?? cfg.httpHost,
-          port: values.port ? Number(values.port) : cfg.httpPort,
-          token: cfg.httpToken,
-          factory,
-          log,
-        });
-        log(`tools: ${factory().tools.join(", ")}`);
-        await new Promise<void>(() => undefined); // serve até o processo ser encerrado
-        void handle;
-        return -1;
+        const { startRemote } = await import("./mcp/remote.js");
+        const host = values.host ?? cfg.httpHost;
+        const port = values.port ? Number(values.port) : cfg.httpPort;
+        await startRemote({ config: cfg, client, host, port, log });
+        return -1; // o servidor HTTP mantém o processo vivo até SIGTERM
       }
-      const { server, tools } = factory();
+      const { server, tools } = createBubbleMcpServer({ config: cfg, client, audit: new AuditLog(cfg.auditLog) });
       if (cfg.mode !== "read-only") {
         const live = cfg.env === "live" ? (cfg.allowLiveWrites ? "LIVE COM ESCRITA LIBERADA" : "live bloqueado para escrita") : "test";
         log(`modo ${cfg.mode} (${live}); workflows liberados: ${cfg.workflowAllowlist.join(", ") || "nenhum"}`);

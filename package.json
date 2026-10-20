@@ -1,6 +1,6 @@
 {
   "name": "bubble-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Bubble Bridge — servidor MCP + CLI para apps Bubble.io: runtime (leitura/escrita com guardas) e build de elementos de plugin",
   "main": "dist/index.js",
   "scripts": {

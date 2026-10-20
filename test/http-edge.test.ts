@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { serveHttp, type HttpServeOptions, type HttpServerHandle } from "../src/mcp/http.js";
 import { createBubbleMcpServer } from "../src/mcp/server.js";
 import { loadConfig } from "../src/config.js";
+import { staticTokenAuth } from "../src/core/clients.js";
 import { BubbleClient } from "../src/core/client.js";
 import { fakeBubble, makeRows } from "./fake-bubble.js";
 
@@ -17,7 +18,7 @@ function factory() {
 
 const handles: HttpServerHandle[] = [];
 async function start(extra: Partial<HttpServeOptions> = {}) {
-  const h = await serveHttp({ host: "127.0.0.1", port: 0, token: TOKEN, factory, ratePerMin: 0, ...extra });
+  const h = await serveHttp({ host: "127.0.0.1", port: 0, authenticate: staticTokenAuth(TOKEN, "read-only"), factory, ratePerMin: 0, ...extra });
   handles.push(h);
   return h.url;
 }
