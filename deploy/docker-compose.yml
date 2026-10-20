@@ -13,6 +13,9 @@ services:
       # 8787 no host, publicada só no IP da VM na rede interna (obrigatório: sem ele a stack não sobe).
       - "${BRIDGE_BIND_IP:?defina BRIDGE_BIND_IP com o IP interno da VM}:8787:8787"
     environment:
+      # Listen DENTRO do container: fixo. A restrição ao IP interno é feita no ports acima.
+      BUBBLE_BRIDGE_HTTP_HOST: 0.0.0.0
+      BUBBLE_BRIDGE_HTTP_PORT: "8787"
       BUBBLE_APP_URL: ${BUBBLE_APP_URL:?defina BUBBLE_APP_URL}
       BUBBLE_API_TOKEN: ${BUBBLE_API_TOKEN:-}
       BUBBLE_ENV: ${BUBBLE_ENV:-test}
