@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bubble": {
+      "type": "local",
+      "command": ["node", "/CAMINHO/ABSOLUTO/bubble-bridge/dist/cli.js", "serve"],
+      "enabled": true,
+      "environment": {
+        "BUBBLE_ENV_FILE": "/CAMINHO/ABSOLUTO/bubble-bridge/.env"
+      },
+      "timeout": 10000
+    }
+  }
+}

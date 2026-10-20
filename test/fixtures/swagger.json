@@ -1,0 +1,74 @@
+{
+  "swagger": "2.0",
+  "info": { "title": "meuapp", "version": "1.1" },
+  "basePath": "/version-test/api/1.1",
+  "paths": {
+    "/obj/pedido": {
+      "get": {
+        "responses": {
+          "200": {
+            "schema": {
+              "properties": {
+                "response": {
+                  "properties": {
+                    "cursor": { "type": "integer" },
+                    "results": { "type": "array", "items": { "$ref": "#/definitions/Pedido" } },
+                    "count": { "type": "integer" },
+                    "remaining": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": { "responses": { "201": { "description": "created" } } }
+    },
+    "/obj/pedido/{UID}": {
+      "get": {
+        "responses": { "200": { "schema": { "properties": { "response": { "$ref": "#/definitions/Pedido" } } } } }
+      }
+    },
+    "/obj/item do pedido": {
+      "get": { "responses": { "200": { "description": "sem schema" } } }
+    },
+    "/obj/user": {
+      "get": { "responses": { "200": { "description": "sem schema, cai no fallback por nome" } } }
+    },
+    "/wf/fechar_pedido": {
+      "post": {
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "schema": {
+              "properties": {
+                "pedido": { "type": "string" },
+                "notificar": { "type": "boolean" }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "Pedido": {
+      "properties": {
+        "_id": { "type": "string" },
+        "Created Date": { "type": "string", "format": "date-time" },
+        "total": { "type": "number" },
+        "cliente": { "$ref": "#/definitions/User" },
+        "itens": { "type": "array", "items": { "$ref": "#/definitions/ItemDoPedido" } },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "pago": { "type": "boolean" }
+      }
+    },
+    "User": {
+      "properties": {
+        "_id": { "type": "string" },
+        "email": { "type": "string" }
+      }
+    }
+  }
+}

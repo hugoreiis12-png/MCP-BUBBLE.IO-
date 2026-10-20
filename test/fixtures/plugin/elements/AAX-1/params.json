@@ -1,0 +1,14 @@
+{
+  "add_is_visible": true,
+  "category": "visual elements",
+  "default_dim": { "height": 60, "width": 320 },
+  "display": "Contador BB",
+  "fields": {
+    "AAa": { "caption": "Título", "editor": "DynamicValue", "name": "titulo", "rank": 0, "value": "text" },
+    "AAb": { "caption": "Inicial", "editor": "DynamicValue", "name": "inicial", "rank": 1, "value": "number" },
+    "AAc": { "caption": "Passo", "editor": "DynamicValue", "name": "passo", "rank": 2, "value": "number" },
+    "AAd": { "caption": "Cor", "editor": "Color", "name": "cor", "rank": 3 }
+  },
+  "icon": "ion-plus",
+  "property_applications": { "resizable": true }
+}

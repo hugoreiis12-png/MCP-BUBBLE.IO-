@@ -1,0 +1,8 @@
+node_modules/
+dist/
+exports/
+logs/
+.env
+*.bubble
+bubble-types.ts
+build/
