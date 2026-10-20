@@ -21,7 +21,7 @@ describe("element build → repositório do plugin", () => {
     const r = await buildElement({ entry: ENTRY, pluginDir: repo });
     expect(r.target).toBe("plugin");
     expect(r.elementDir).toBe(join(repo, "elements/AAX-1"));
-    expect(r.files.map((f) => f.split("/").pop()).sort()).toEqual(["headers.html", "initialize.js", "preview.js", "reset.js", "update.js"]);
+    expect(r.files.map((f) => f.split(/[\\/]/).pop()).sort()).toEqual(["headers.html", "initialize.js", "preview.js", "reset.js", "update.js"]);
     expect(await readFile(join(repo, "elements/AAX-1/params.json"), "utf8")).toBe(paramsBefore);
     const init = await readFile(join(r.elementDir, "initialize.js"), "utf8");
     expect(init.startsWith("function(instance, context) {")).toBe(true);
