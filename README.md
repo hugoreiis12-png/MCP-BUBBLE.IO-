@@ -44,6 +44,11 @@ No editor do Bubble (Settings > API): habilite a Data API para os tipos desejado
 | `BUBBLE_WORKFLOW_ALLOWLIST` | vazio | Workflows que `bubble_workflow_run` pode disparar (lista separada por vírgula) |
 | `BUBBLE_AUDIT_LOG` | desligado | Log JSONL de cada chamada (sem token e sem payload) |
 | `BUBBLE_EXPORT_DIR` | `./exports` | Exportações e snapshots de registros apagados |
+| `BUBBLE_EDITOR_SESSION` | vazio | Cookie da sessão da conta Bubble (ex.: `meta_test_u2main=…`). Sem ele, as tools de editor não são registradas |
+| `BUBBLE_EDITOR_APP_ID` | vazio | Id do app no editor Bubble |
+| `BUBBLE_EDITOR_BRANCH` | `version-test` | `version-test` (dev) ou `version-live` (publicado) |
+| `BUBBLE_EDITOR_API_BASE` | `https://editor.bubbleapps.io/version-test/api/1.1/` | Base da API interna do editor |
+| `BUBBLE_EDITOR_OPS` | vazio | Mapa JSON `{op: {method, path}}` das operações de design que o operador autoriza |
 
 ## Tools MCP
 
@@ -62,6 +67,11 @@ No editor do Bubble (Settings > API): habilite a Data API para os tipos desejado
 | `bubble_data_delete` | admin | snapshot + `DELETE /obj/{type}/{id}` |
 | `bubble_exposure_audit` | read-only | GET **sem token** em N tipos → quais vazam, com gravidade |
 | `bubble_anonymous_read` | read-only | PoC: GET sem token em 1 tipo |
+| `bubble_design_read` | read-only | `GET /meta` normalizado: tipos, campos (id interno), workflows e `auth_unecessary` |
+| `bubble_workflow_exposure_audit` | read-only | Workflows **públicos**: `declared` (só `/meta`, zero escrita) ou `active` (POST anônimo, ignora nomes destrutivos) |
+| `bubble_editor_discover` | read-only | Schema do app interno do editor → operações candidatas a ler/escrever design |
+| `bubble_editor_read` | read-only | Documento de design cru, via uma operação aprovada em `BUBBLE_EDITOR_OPS` |
+| `bubble_editor_write` | admin | Escreve design via operação aprovada; `dry_run` + `plan_id`; `verify=design\|schema\|none` |
 
 Respostas valem `structuredContent` + texto compacto; **teto de 16 KB por resposta** (arrays grandes são cortados e marcados `_truncated`) e **fila de 6 chamadas em voo** para não rajada na Data API. As tools `bubble_data_query`, `bubble_data_get` e `bubble_schema_discover` da v0.2 foram substituídas por `bubble_query` e `bubble_schema`.
 
@@ -157,6 +167,51 @@ devolve os 291 tipos e 191 workflows a qualquer visitante).
 **Limitação**: a classificação é heurística, por nome de campo. Ela ordena o que corrigir
 primeiro; não substitui a análise manual das privacy rules.
 
+## Plano de design (v0.4)
+
+Além dos dados, o Bridge lê o **contrato de design** do app e — com a sessão da conta
+— escreve nele. A referência completa está em [`docs/design-plane.md`](docs/design-plane.md).
+
+**Leitura (funciona com o token do app, hoje):** `GET /meta` devolve os tipos com o
+**id interno de cada campo**, a taxonomia (`text`, `number`, `custom.<tipo>`,
+`list.<tipo>`, `option.<option-set>`…) e os 192 backend workflows com a assinatura
+completa — inclusive o flag `auth_unecessary`.
+
+```bash
+node dist/cli.js design                              # resumo do contrato
+node dist/cli.js design --type meusexecutáveisedocumentos
+```
+
+Via MCP: `bubble_design_read` (`list_types`, `get_type`, `list_workflows`,
+`get_workflow`).
+
+**Escrita (exige a sessão da conta Bubble):** o token do app é recusado pela
+plataforma (`401 Invalid or expired token`), então as tools de editor usam o cookie
+da conta (`BUBBLE_EDITOR_SESSION`) + `BUBBLE_EDITOR_APP_ID`. Como essa sessão
+alcança **todos os apps que a conta puder editar**, ela:
+
+- só liga as tools se o operador configurar explicitamente as duas variáveis;
+- nunca entra no log de auditoria nem no `bubble_config`;
+- só registra `bubble_editor_write` no modo `admin`;
+- exige `BUBBLE_ALLOW_LIVE_WRITES=true` para tocar no branch publicado.
+
+As operações executadas não são adivinhadas: `BUBBLE_EDITOR_OPS` é um mapa que o
+operador aprova (`{op: {method, path}}`), e `bubble_editor_discover` mostra as
+candidatas para montá-lo.
+
+**Deploy tem trava própria:** no Bubble, publicar o branch `version-test` já é um
+deploy do app público. Então uma operação de publish/deploy exige
+`BUBBLE_ALLOW_LIVE_WRITES=true` mesmo com o branch de dev — o dry-run também é
+recusado, e o plano avisa que a operação publica em produção.
+
+**Achado de segurança no app `comprover`:** 163 dos 192 workflows são públicos
+(`auth_unecessary: true`) — respondem a `POST` anônimo sem token. O `wf/admin`
+devolve a biblioteca de executáveis e documentos do painel administrativo; existem
+ainda workflows públicos que **emitem token de sessão** (`login_nativo`,
+`logar_cliente`) e um que **troca senha sem autenticação** (`trocar_senha`).
+`bubble_workflow_exposure_audit` lista isso (`declared`, sem tráfego de escrita) e
+confirma com POST anônimo (`active`).
+
 ## Servir por HTTP (execução remota)
 
 O `serve` padrão é stdio. Para vários clients consumirem um servidor só, use o transporte
@@ -184,7 +239,7 @@ node dist/cli.js serve --http --port 8787             # bind 127.0.0.1 por padr�
 ## Testes
 
 ```bash
-npm test           # 117 testes: http, cliente, export, escrita, MCP, build e runtime de elementos em jsdom
+npm test           # 142 testes: http, cliente, export, escrita, MCP, design, editor, build e runtime de elementos em jsdom
 npm run typecheck  # código, testes e elementos
 ```
 
@@ -192,6 +247,9 @@ npm run typecheck  # código, testes e elementos
 
 - [ ] Escrita: rodar `create` → `update` → `delete` num tipo de teste em `version-test`.
 - [ ] `/bulk`: confirmar o formato de resposta por linha com um item inválido no lote.
+- [ ] Design: `bubble_editor_write` end-to-end contra o app real (falta o cookie da conta e o mapa `BUBBLE_EDITOR_OPS`).
+- [ ] Design: quais operações do `editor.bubbleapps.io` leem e salvam o documento de design — `bubble_editor_discover` responde isso, mas nunca foi rodado com sessão válida.
+- [ ] Design: `verify=schema` só confirma depois de publicar o branch; falta o teste real desse ciclo.
 - [ ] Elemento: sync do `contador` num plugin real, uso numa página, e conferir se estados e eventos aparecem no editor com os nomes do código.
 - [ ] Formato de estados e eventos no `params.json` depois do sync — o build hoje só avisa que não consegue confirmar. Se você me mandar esse arquivo, a checagem passa a ser estrita.
 - [ ] Tamanho do `headers.html`: o bundle com React 19 tem cerca de 220 KB por elemento. Se o Bubble limitar headers ou vários elementos pesarem, o próximo passo é um React compartilhado no header do plugin, ou Preact.

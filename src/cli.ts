@@ -27,6 +27,11 @@ Comandos
                                 Compila um elemento React para os arquivos do Plugin Editor
   exposure [--type T] [--live]   PoC: lê um tipo SEM token e diz se está exposto
   exposure [--all] [--live]     Varre a Data API sem token e classifica a gravidade
+  design [--type T]             Contrato de design do app (/meta): tipos, ids internos, workflows
+  editor discover               Sonda o editor: sessão, versão do design e nós da raiz
+  editor read --path P          Lê um nó do design (--children N desce N níveis)
+  editor write --path P --value JSON [--execute]
+                                Escreve/apaga um nó do design (sem --execute é só dry-run)
   serve --http [--host H] [--port N]
                                 Serve o MCP por HTTP (Streamable HTTP) em vez de stdio.
                                 Exige BUBBLE_BRIDGE_CLIENTS_FILE ou BUBBLE_BRIDGE_HTTP_TOKEN.
@@ -41,6 +46,13 @@ Configuração por variáveis de ambiente (ou .env no diretório atual):
   BUBBLE_MODE        read-only | read-write | admin       (padrão: read-only)
   BUBBLE_AUDIT_LOG   caminho do log JSONL de auditoria    (padrão: desligado)
   BUBBLE_EXPORT_DIR  diretório das exportações            (padrão: ./exports)
+
+  Plano de design (editor) — opcional:
+  BUBBLE_EDITOR_SESSION  cookie da conta Bubble (meta_test_u2main / meta_live_u2main)
+  BUBBLE_EDITOR_APP_ID   appname do app alvo (ex.: comprover)
+  BUBBLE_EDITOR_BRANCH   version-test | version-live        (padrão: version-test)
+  BUBBLE_EDITOR_BASE     base do editor                     (padrão: https://scheduled.bubble.io)
+  BUBBLE_EDITOR_OPS      JSON { operacao: { method, path } } — só o que for aprovado aqui é executável
 `;
 
 const log = (msg: string) => process.stderr.write(`[bubble-bridge] ${msg}\n`);
@@ -100,6 +112,10 @@ async function main(argv: string[]): Promise<number> {
       concurrency: { type: "string" },
       mode: { type: "string" },
       file: { type: "string" },
+      path: { type: "string" },
+      value: { type: "string" },
+      children: { type: "string" },
+      execute: { type: "boolean", default: false },
     },
     strict: true,
   });
@@ -110,6 +126,81 @@ async function main(argv: string[]): Promise<number> {
   };
 
   if (command === "clients") return runClients(positionals, values.mode, values.file);
+
+  // Plano de design: precisa da sessão da conta, não do token da API do app.
+  if (command === "editor") {
+    const sub = positionals[0];
+    const { readFileSync } = await import("node:fs");
+    const { BubbleEditorSession, parseEditorOps } = await import("./core/editor.js");
+    const { editorAppVersion } = await import("./config.js");
+    const cfgEditor = loadConfig();
+    if (!cfgEditor.editorSession || !cfgEditor.editorAppId) {
+      throw new Error(
+        "Faltam BUBBLE_EDITOR_SESSION e BUBBLE_EDITOR_APP_ID. O token da API do app não alcança o editor: " +
+          "a API dele responde 401 para quem não for a conta.",
+      );
+    }
+    const session = new BubbleEditorSession({
+      session: cfgEditor.editorSession,
+      appId: cfgEditor.editorAppId,
+      appVersion: editorAppVersion(cfgEditor),
+      base: cfgEditor.editorBase,
+      ops: parseEditorOps(cfgEditor.editorOps, (p) => readFileSync(p, "utf8")),
+      http: makeClient(cfgEditor).httpOptions,
+    });
+
+    if (sub === "discover") {
+      print(await session.discover());
+      return 0;
+    }
+    if (sub === "read") {
+      const paths = values.path ? [values.path] : ["settings"];
+      print(await session.readDesign(paths, { children: values.children ? Number(values.children) : 0 }));
+      return 0;
+    }
+    if (sub === "write") {
+      const path = need(values.path, "--path");
+      // Falha fechado: escrever no branch público é deploy do app.
+      if (editorAppVersion(cfgEditor) === "live" && !cfgEditor.allowLiveWrites) {
+        throw new Error(
+          "BUBBLE_EDITOR_BRANCH=version-live escreve no app público. " +
+            "Para isso, defina BUBBLE_ALLOW_LIVE_WRITES=true — sem isso o CLI recusa a escrita.",
+        );
+      }
+      const raw = values.value ?? "null";
+      let value: unknown;
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        throw new Error("--value precisa ser JSON válido (use null para apagar o nó)");
+      }
+      const changes = [{ path, value }];
+      const preview = session.previewWrite(changes);
+      if (!values.execute) {
+        print({
+          dry_run: true,
+          aviso: "nada foi alterado — rode de novo com --execute para aplicar",
+          metodo: preview.method,
+          endpoint: preview.endpoint,
+          corpo: preview.body,
+        });
+        return 0;
+      }
+      const antes = await session.readNode(path).catch(() => undefined);
+      const escrita = await session.writeDesign(changes);
+      const depois = await session.readNode(path).catch(() => undefined);
+      const { canonicalJson, redactDesignSecrets } = await import("./core/editor.js");
+      print({
+        aplicado: true,
+        resposta: escrita,
+        antes: antes?.data ?? null,
+        depois: depois?.data ?? null,
+        verificado: canonicalJson(depois?.data ?? null) === canonicalJson(redactDesignSecrets(value)),
+      });
+      return 0;
+    }
+    throw new Error("uso: bubble-bridge editor discover | read --path P | write --path P --value JSON [--execute]");
+  }
 
   // Build de elemento não fala com o app: não exige BUBBLE_APP_URL.
   if (command === "element") {
@@ -214,6 +305,48 @@ async function main(argv: string[]): Promise<number> {
         ok = false;
         print({ meta: "falhou", error: String(err instanceof Error ? err.message : err) });
       }
+      // Plano de design: opcional. Só reprova o doctor se a credencial foi
+      // configurada e não respondeu — ausência de sessão não é defeito.
+      try {
+        const { readFileSync } = await import("node:fs");
+        const { BubbleEditorSession, parseEditorOps } = await import("./core/editor.js");
+        const { editorAppVersion } = await import("./config.js");
+        if (!cfg.editorSession || !cfg.editorAppId) {
+          print({
+            editor: "não configurado",
+            motivo: "sem BUBBLE_EDITOR_SESSION e BUBBLE_EDITOR_APP_ID as tools de design não são registradas (o token do app não alcança o editor)",
+          });
+        } else {
+          const ops = parseEditorOps(cfg.editorOps, (p) => readFileSync(p, "utf8"));
+          const session = new BubbleEditorSession({
+            session: cfg.editorSession,
+            appId: cfg.editorAppId,
+            appVersion: editorAppVersion(cfg),
+            base: cfg.editorBase,
+            ops,
+            http: client.httpOptions,
+          });
+          const probe = await session.probe();
+          print({
+            editor: {
+              branch: cfg.editorBranch,
+              base: cfg.editorBase,
+              app: cfg.editorAppId,
+              versao: editorAppVersion(cfg),
+              sessao: "definida",
+              operacoes: session.opNames(),
+              ...probe,
+            },
+          });
+          if (!probe.reachable) {
+            ok = false;
+            print({ editorAviso: "a sessão não respondeu — confira o cookie da conta e o app/branch" });
+          }
+        }
+      } catch (err) {
+        ok = false;
+        print({ editor: "falhou", error: String(err instanceof Error ? err.message : err) });
+      }
       return ok ? 0 : 1;
     }
     case "discover":
@@ -250,6 +383,24 @@ async function main(argv: string[]): Promise<number> {
         onProgress: ({ total, window }) => log(`${type}: ${total} registros (janela ${window})`),
       });
       print(result);
+      return 0;
+    }
+    case "design": {
+      const { normalizeDesign } = await import("./core/design.js");
+      const design = normalizeDesign(await client.meta());
+      if (values.type) {
+        const t = design.types.find((x) => x.name === values.type);
+        if (!t) throw new Error(`tipo "${values.type}" não existe no design do app`);
+        print(t);
+        return 0;
+      }
+      print({
+        app: design.app,
+        counts: design.counts,
+        warnings: design.warnings,
+        tipos: design.types.map((t) => ({ name: t.name, display: t.display, fields: t.fields.length, readable: t.readable })),
+        workflows_publicos: design.workflows.filter((w) => w.public).map((w) => w.name),
+      });
       return 0;
     }
     default:

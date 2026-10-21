@@ -65,7 +65,48 @@ const ConfigSchema = z.object({
         .map((x) => x.trim())
         .filter(Boolean),
     ),
+  /**
+   * Cookie de sessão da conta Bubble — credencial do plano de design (editor).
+   * Sem ele, as tools de editor ficam desregistradas: o token da API do app
+   * não alcança o design. Nunca é registrado em log.
+   */
+  editorSession: z.string().min(1).optional(),
+  /**
+   * Base HTTP do **editor** — o host que serve o editor e a API interna de
+   * design (`/appeditor/*`). É diferente do host da API do app (`/api/1.1`).
+   */
+  editorBase: z
+    .string()
+    .url("BUBBLE_EDITOR_BASE precisa ser uma URL completa, ex.: https://scheduled.bubble.io")
+    .default("https://scheduled.bubble.io"),
+  /**
+   * @deprecated BUBBLE_EDITOR_API_BASE —use `BUBBLE_EDITOR_BASE`. Mantido só
+   * como fallback para não quebrar quem já tinha a variável no ambiente.
+   */
+  editorApiBase: z
+    .string()
+    .url("BUBBLE_EDITOR_API_BASE precisa ser uma URL completa")
+    .optional(),
+  /**
+   * App alvo no editor — o *appname* (slug) que o editor usa no caminho das
+   * operações, ex.: `comprover`.
+   */
+  editorAppId: z.string().min(1).optional(),
+  /** Branch do design alvo: dev (`version-test`) ou publicado (`version-live`). */
+  editorBranch: z.enum(["version-test", "version-live"]).default("version-test"),
+  /** Mapa de operações do editor: JSON inline ou caminho de arquivo. */
+  editorOps: z.string().optional(),
 });
+
+/**
+ * Versão do design (`app_version`) correspondente ao branch configurado.
+ *
+ * O editor chama o branch de desenvolvimento de `test` e o publicado de
+ * `live` — é assim que os endpoints de design os nomeiam.
+ */
+export function editorAppVersion(cfg: BridgeConfig): "test" | "live" {
+  return cfg.editorBranch === "version-live" ? "live" : "test";
+}
 
 export type BridgeConfig = z.infer<typeof ConfigSchema>;
 
@@ -94,6 +135,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     searchCap: env.BUBBLE_SEARCH_CAP || undefined,
     allowLiveWrites: env.BUBBLE_ALLOW_LIVE_WRITES || undefined,
     workflowAllowlist: env.BUBBLE_WORKFLOW_ALLOWLIST || undefined,
+    editorSession: env.BUBBLE_EDITOR_SESSION || undefined,
+    editorBase: env.BUBBLE_EDITOR_BASE || env.BUBBLE_EDITOR_API_BASE || undefined,
+    editorApiBase: env.BUBBLE_EDITOR_API_BASE || undefined,
+    editorAppId: env.BUBBLE_EDITOR_APP_ID || undefined,
+    editorBranch: env.BUBBLE_EDITOR_BRANCH || undefined,
+    editorOps: env.BUBBLE_EDITOR_OPS || undefined,
     httpToken: env.BUBBLE_BRIDGE_HTTP_TOKEN || undefined,
     httpHost: env.BUBBLE_BRIDGE_HTTP_HOST || undefined,
     httpPort: env.BUBBLE_BRIDGE_HTTP_PORT || undefined,
@@ -122,6 +169,14 @@ export function redactedConfig(cfg: BridgeConfig): Record<string, unknown> {
     searchCap: cfg.searchCap,
     allowLiveWrites: cfg.allowLiveWrites,
     workflowAllowlist: cfg.workflowAllowlist,
+    editor: {
+      sessao: cfg.editorSession ? `definida (${cfg.editorSession.length} caracteres)` : "ausente — tools de design ficam indisponíveis",
+      base: cfg.editorBase,
+      app: cfg.editorAppId ?? "ausente",
+      version: editorAppVersion(cfg),
+      branch: cfg.editorBranch,
+      ops: cfg.editorOps ? "definido (customizado)" : "padrão (operações medidas no editor)",
+    },
     http: cfg.httpToken ? `token definido (${cfg.httpToken.length} caracteres)` : "desligado (serve --http recusa sem token)",
     httpHost: cfg.httpHost,
     httpPort: cfg.httpPort,

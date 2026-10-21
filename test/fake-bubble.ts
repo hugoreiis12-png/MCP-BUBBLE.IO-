@@ -14,6 +14,8 @@ export interface FakeOptions {
    * "capped" conta só até o teto; "total" conta todos os registros da busca.
    */
   remaining?: "capped" | "total";
+  /** Workflows que o app declara públicos: respondem 200 mesmo sem token. */
+  publicWorkflows?: string[];
 }
 
 /**
@@ -34,12 +36,50 @@ export function fakeBubble(data: Record<string, Thing[]>, opts: FakeOptions = {}
       throttle--;
       return new Response("", { status: 429, headers: { "retry-after": "0" } });
     }
+    const path = url.pathname.replace(/^\/version-test/, "");
+    const wfMatch = /^\/api\/1\.1\/wf\/([^/]+)$/.exec(path);
     if (opts.token && (init?.headers as Record<string, string>)?.Authorization !== `Bearer ${opts.token}`) {
+      // Workflow declarado público no app responde sem token: o leak é do app, não do token.
+      if (wfMatch && opts.publicWorkflows?.includes(decodeURIComponent(wfMatch[1]!))) {
+        return json(200, { status: "success", response: { executaveis: [{ _id: "doc1", nome: "backup" }] } });
+      }
       return json(401, { error_class: "Unauthorized", translation: "You do not have permission" });
     }
-    const path = url.pathname.replace(/^\/version-test/, "");
     if (path === "/api/1.1/meta/swagger.json") return json(200, swagger);
-    if (path === "/api/1.1/meta") return json(200, { get: Object.keys(data), post: [] });
+    if (path === "/api/1.1/meta") {
+      const types: Record<string, unknown> = {};
+      for (const name of Object.keys(data)) {
+        types[name] = {
+          display: name,
+          fields: [
+            { id: `${name}_f_nome_custom`, display: "nome", type: "text" },
+            { id: `${name}_f_total_number`, display: "total", type: "number" },
+            { id: `${name}_f_itens_list_${name}`, display: "itens", type: `list.custom.${name}` },
+          ],
+        };
+      }
+      return json(200, {
+        get: Object.keys(data),
+        post: [
+          {
+            endpoint: "admin",
+            method: "post",
+            auth_unecessary: true,
+            parameters: [{ key: "_wf_request_data", value: "api_wf_data.bXOXT", optional: false, param_in: "body" }],
+            return_btype: { executaveis: "list.custom.meusexecutaveisdocumentos" },
+          },
+          {
+            endpoint: "login",
+            method: "post",
+            auth_unecessary: false,
+            parameters: [{ key: "_wf_request_data", value: "api_wf_data.bUWEg0", optional: false, param_in: "body" }],
+            return_btype: { token: "text" },
+          },
+        ],
+        types,
+        app_data: { appname: "meuapp", app_version: "test" },
+      });
+    }
 
     const method = init?.method ?? "GET";
     if (method !== "GET") {

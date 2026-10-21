@@ -1,4 +1,5 @@
 import { requestJson, type HttpOptions } from "./http.js";
+import { BubbleApiError } from "./errors.js";
 
 /** Categorias que definem a gravidade de um campo lido por um atacante anônimo. */
 export type FindingKind = "credential" | "pii" | "sensitive";
@@ -174,6 +175,122 @@ export function levelOf(exposed: boolean, findings: FieldFinding[]): ExposureLev
   if (findings.some((f) => f.kind === "pii")) return "high";
   if (findings.some((f) => f.kind === "sensitive")) return "high";
   return "low";
+}
+
+export interface WorkflowExposureResult {
+  workflow: string;
+  apiRoot: string;
+  status: number;
+  /** true = o workflow respondeu sem exigir autenticação (o 401 do Bubble não apareceu). */
+  exposed: boolean;
+  /** true = o /meta do app declara este workflow como `auth_unecessary`. */
+  declaredPublic: boolean;
+  /** Mensagem de erro/sucesso devolvida pelo app (corta o payload bruto). */
+  message?: string;
+  /** Amostra mascarada da resposta; só quando include_sample=true. */
+  sample?: Record<string, string>;
+  error?: string;
+}
+
+export interface WorkflowProbeOptions {
+  apiRoot: string;
+  workflow: string;
+  http?: HttpOptions;
+  includeSample?: boolean;
+}
+
+/**
+ * POST em `/wf/{name}` **sem o header Authorization**, com corpo vazio.
+ *
+ * O Bubble responde 401 ("You must authenticate to call this method") quando o
+ * workflow exige sessão. Qualquer outra resposta (200, 400 complaining de campo
+ * faltando, 500) prova que o workflow foi alcançado por um atacante anônimo —
+ * falta só o payload, que o atacante também tem.
+ *
+ * Efeito colateral: um workflow com nome destrutivo pode agir mesmo com corpo
+ * vazio. Por isso o sweep ignora os nomes perigosos, salvo pedido explícito.
+ */
+export async function probeAnonymousWorkflow(opts: WorkflowProbeOptions): Promise<WorkflowExposureResult> {
+  const url = `${opts.apiRoot}/wf/${encodeURIComponent(opts.workflow)}`;
+  const base = { workflow: opts.workflow, apiRoot: opts.apiRoot, status: 0, exposed: false, declaredPublic: false };
+  try {
+    const res = await requestJson<Record<string, unknown>>(url, { method: "POST", body: {} }, opts.http ?? {});
+    return {
+      ...base,
+      status: 200,
+      exposed: true,
+      message: typeof res?.status === "string" ? `status=${res.status}` : "respondeu 200 sem autenticação",
+      ...(opts.includeSample ? { sample: redactSample(res) } : {}),
+    };
+  } catch (err) {
+    const status = typeof (err as { status?: number }).status === "number" ? (err as { status: number }).status : 0;
+    const message = err instanceof BubbleApiError ? err.bubbleMessage : err instanceof Error ? err.message : String(err);
+    const exposed = status !== 401 && status !== 0;
+    return {
+      ...base,
+      status,
+      exposed,
+      message: message.slice(0, 300),
+    };
+  }
+}
+
+/** Nomes que sugerem efeito colateral: não são sondados sem lista explícita. */
+export const DESTRUCTIVE_WORKFLOW_RE =
+  /(delete|remove|apagar|excluir|drop|truncate|purge|desativar|disable|send|enviar|email|cobrar|pagar|pagamento|payment|deploy|publish)/i;
+
+export interface WorkflowSweepOptions {
+  apiRoot: string;
+  workflows: string[];
+  concurrency?: number;
+  includeSample?: boolean;
+  http?: HttpOptions;
+  /** Ignora o filtro de nomes destrutivos (exige lista explícita do operador). */
+  allowDestructive?: boolean;
+}
+
+export interface WorkflowSweepResult {
+  apiRoot: string;
+  probed: number;
+  exposed: number;
+  /** Workflows que o app declara públicos no /meta (sem tráfego extra). */
+  declaredPublic: string[];
+  leaks: WorkflowExposureResult[];
+  errors: Array<{ workflow: string; status: number; message: string }>;
+}
+
+/** Sonda vários workflows sem token, com limite de concorrência. */
+export async function sweepAnonymousWorkflows(opts: WorkflowSweepOptions): Promise<WorkflowSweepResult> {
+  const targets = opts.allowDestructive ? opts.workflows : opts.workflows.filter((w) => !DESTRUCTIVE_WORKFLOW_RE.test(w));
+  const leaks: WorkflowExposureResult[] = [];
+  const errors: WorkflowSweepResult["errors"] = [];
+  let next = 0;
+  const workers = Math.min(Math.max(opts.concurrency ?? 4, 1), 8);
+  const consume = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= targets.length) return;
+      const name = targets[i]!;
+      const r = await probeAnonymousWorkflow({
+        apiRoot: opts.apiRoot,
+        workflow: name,
+        includeSample: opts.includeSample,
+        http: opts.http,
+      });
+      if (r.exposed) leaks.push(r);
+      else if (r.status !== 401) errors.push({ workflow: name, status: r.status, message: r.error ?? r.message ?? "" });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(workers, targets.length) }, consume));
+  leaks.sort((a, b) => b.status - a.status || a.workflow.localeCompare(b.workflow));
+  return {
+    apiRoot: opts.apiRoot,
+    probed: targets.length,
+    exposed: leaks.length,
+    declaredPublic: [],
+    leaks,
+    errors,
+  };
 }
 
 const KIND_RANK: Record<FindingKind, number> = { credential: 0, pii: 1, sensitive: 2 };

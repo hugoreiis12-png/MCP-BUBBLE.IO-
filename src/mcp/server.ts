@@ -1,11 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { modeRank, redactedConfig, type BridgeConfig, type BubbleEnv, type Mode } from "../config.js";
+import { editorAppVersion, modeRank, redactedConfig, type BridgeConfig, type BubbleEnv, type Mode } from "../config.js";
 import { AuditLog } from "../core/audit.js";
 import { effectiveMode, type ClientIdentity } from "../core/clients.js";
 import { BULK_MAX, BubbleClient, CONSTRAINT_TYPES, MAX_PAGE_LIMIT, apiRootFor } from "../core/client.js";
-import { SENSITIVE_TYPE_RE, probeAnonymous, sweepAnonymous } from "../core/recon.js";
+import { SENSITIVE_TYPE_RE, probeAnonymous, sweepAnonymous, sweepAnonymousWorkflows } from "../core/recon.js";
+import { fieldIndex, normalizeDesign, typeReferences } from "../core/design.js";
+import { BubbleEditorSession, canonicalJson, parseEditorOps, redactDesignSecrets, shrinkPath, type EditorChange } from "../core/editor.js";
 import {
   assertWritable,
   planId,
@@ -112,10 +115,11 @@ const constraintSchema = z.object({
 export interface SharedState {
   limiter: InflightLimiter;
   swagger: { value: unknown; at: number };
+  meta: { value: unknown; at: number };
 }
 
 export function createSharedState(): SharedState {
-  return { limiter: new InflightLimiter(MAX_INFLIGHT), swagger: { value: null, at: 0 } };
+  return { limiter: new InflightLimiter(MAX_INFLIGHT), swagger: { value: null, at: 0 }, meta: { value: null, at: 0 } };
 }
 
 const SWAGGER_TTL_MS = 60_000;
@@ -142,7 +146,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
   const { config, client, identity } = deps;
   const audit = deps.audit ?? new AuditLog(config.auditLog);
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  const { limiter, swagger } = deps.shared ?? createSharedState();
+  const { limiter, swagger, meta } = deps.shared ?? createSharedState();
   const mode = identity ? effectiveMode(identity.mode, config.mode) : config.mode;
 
   /** Cache de 60 s do swagger: evitar refetch de ~500 KB em fatias seguidas de bubble_schema. */
@@ -151,6 +155,14 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
     swagger.value = await client.swagger();
     swagger.at = Date.now();
     return swagger.value;
+  }
+
+  /** Cache de 60 s do /meta: contrato de design (~850 KB) lido pelas tools de design. */
+  async function metaCached(): Promise<unknown> {
+    if (meta.value && Date.now() - meta.at < SWAGGER_TTL_MS) return meta.value;
+    meta.value = await client.meta();
+    meta.at = Date.now();
+    return meta.value;
   }
 
   async function run(
@@ -230,6 +242,60 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
   };
   const fieldsSchema = z.record(z.string(), z.unknown());
   const objEndpoint = (type: string) => `${client.apiRoot}/obj/${encodeURIComponent(type)}`;
+
+  /**
+   * Sessão do editor (plano de design). **Falha fechada**: sem cookie de conta
+   * e sem app id não existe operação de design — o token da API do app é
+   * escopado ao tenant e a plataforma o recusa no plano dela.
+   */
+  function editorSession(): BubbleEditorSession {
+    if (!config.editorSession || !config.editorAppId) {
+      throw new Error(
+        "Tools de design exigem BUBBLE_EDITOR_SESSION (cookie da conta Bubble) e BUBBLE_EDITOR_APP_ID (appname do app). " +
+          "O token da API do app não alcança o editor: a API dele responde 401.",
+      );
+    }
+    const ops = parseEditorOps(config.editorOps, (p) => readFileSync(p, "utf8"));
+    return new BubbleEditorSession({
+      session: config.editorSession,
+      appId: config.editorAppId,
+      appVersion: editorAppVersion(config),
+      base: config.editorBase,
+      ops,
+      http: client.httpOptions,
+    });
+  }
+
+  /**
+   * Escrita no design publicado exige opt-in explícito, como no data plane.
+   *
+   * Dois gates, porque são dois deploys diferentes:
+   * 1. branch `version-live` — a escrita vai direto no app público;
+   * 2. operação de *publish* — publicar o branch `version-test` **já é** um
+   *    deploy do app público no Bubble. Sem o opt-in, um publish passaria
+   *    batendo pelo gate do branch e subiria para produção.
+   */
+  function assertEditorWriteAllowed(op: string): void {
+    if (config.editorBranch === "version-live" && !config.allowLiveWrites) {
+      throw new WriteRefused(
+        "BUBBLE_EDITOR_BRANCH=version-live exige BUBBLE_ALLOW_LIVE_WRITES=true. " +
+          "Use version-test para mexer no design de desenvolvimento.",
+      );
+    }
+    let publish = false;
+    try {
+      publish = editorSession().isPublishOp(op);
+    } catch {
+      publish = false; // sem sessão/mapa: o outro gate já recusa.
+    }
+    if (publish && !config.allowLiveWrites) {
+      throw new WriteRefused(
+        `A operação "${op}" é um publish/deploy. No Bubble, publicar um branch de desenvolvimento já é um deploy do app ` +
+          "público — então exige BUBBLE_ALLOW_LIVE_WRITES=true, mesmo com BUBBLE_EDITOR_BRANCH=version-test. " +
+          "Para só editar o design sem publicar, use uma operação que não seja de publish.",
+      );
+    }
+  }
 
   const specs: ToolSpec[] = [
     {
@@ -479,7 +545,270 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
             }),
         ),
     },
+    {
+      name: "bubble_design_read",
+      minMode: "read-only",
+      register: (s) =>
+        s.registerTool(
+          "bubble_design_read",
+          {
+            title: "Contrato de design do app",
+            description:
+              "Lê o CONTRATO DE DESIGN do app — o que o editor do Bubble enxerga — direto do /meta: tipos com o id interno de " +
+              "cada campo, taxonomia (custom./list./option.), assinatura dos backend workflows (parâmetro, tipo, obrigatoriedade, " +
+              "se exige autenticação) e app_data. Ações: list_types, get_type, list_workflows, get_workflow, app, field_index, references. " +
+              "Read-only: não altera o design.",
+            inputSchema: {
+              action: z
+                .enum(["list_types", "get_type", "list_workflows", "get_workflow", "app", "field_index", "references"])
+                .describe("Fatia pedida do contrato de design"),
+              type: z.string().min(1).optional().describe("Obrigatório para action=get_type"),
+              workflow: z.string().min(1).optional().describe("Obrigatório para action=get_workflow"),
+              filter: z.string().min(1).optional().describe("Filtra por substring em list_types/list_workflows"),
+              limit: z.number().int().min(1).max(500).default(100).describe("Máximo de itens por lista"),
+            },
+            annotations: readOnly,
+          },
+          async ({ action, type, workflow, filter, limit }) =>
+            run("bubble_design_read", type ?? workflow ?? "meta", async () => {
+              const design = normalizeDesign(await metaCached());
+              const need = (v: string | undefined, what: string): string => {
+                if (!v) throw new Error(`action=${action} exige o parâmetro ${what}.`);
+                return v;
+              };
+              const match = (s: string) => !filter || s.toLowerCase().includes(filter.toLowerCase());
+
+              if (action === "app") {
+                return { data: { action, app: design.app, counts: design.counts, warnings: design.warnings } };
+              }
+              if (action === "list_types") {
+                const types = design.types.filter((t) => match(t.name) || match(t.display)).slice(0, limit);
+                return {
+                  data: {
+                    action,
+                    total: design.types.length,
+                    returned: types.length,
+                    types: types.map((t) => ({
+                      name: t.name,
+                      display: t.display,
+                      fields: t.fields.length,
+                      readable: t.readable,
+                    })),
+                  },
+                };
+              }
+              if (action === "get_type") {
+                const t = design.types.find((x) => x.name === need(type, "type"));
+                if (!t) throw new Error(`Tipo "${type}" não existe no design do app.`);
+                return { data: { action, ...t } };
+              }
+              if (action === "list_workflows") {
+                const ws = design.workflows.filter((w) => match(w.name)).slice(0, limit);
+                return {
+                  data: {
+                    action,
+                    total: design.workflows.length,
+                    returned: ws.length,
+                    publicos: design.counts.publicWorkflows,
+                    workflows: ws.map((w) => ({
+                      name: w.name,
+                      method: w.method,
+                      public: w.public,
+                      params: w.params.map((p) => p.key),
+                      returns: Object.keys(w.returns),
+                    })),
+                  },
+                };
+              }
+              if (action === "get_workflow") {
+                const w = design.workflows.find((x) => x.name === need(workflow, "workflow"));
+                if (!w) throw new Error(`Workflow "${workflow}" não existe no design do app.`);
+                return { data: { action, ...w } };
+              }
+              if (action === "field_index") {
+                const idx = fieldIndex(design)
+                  .filter((f) => match(f.type) || match(f.fieldId) || match(f.display))
+                  .slice(0, limit);
+                return { data: { action, total: design.counts.fields, returned: idx.length, fields: idx } };
+              }
+              const refs = typeReferences(design);
+              const out = Object.fromEntries(Object.entries(refs).filter(([k]) => match(k)));
+              return { data: { action, types_com_referencia: out } };
+            }),
+        ),
+    },
+    {
+      name: "bubble_workflow_exposure_audit",
+      minMode: "read-only",
+      register: (s) =>
+        s.registerTool(
+          "bubble_workflow_exposure_audit",
+          {
+            title: "Auditar exposição anônima dos workflows",
+            description:
+              "Audita quais BACKEND WORKFLOWS respondem sem autenticação. mode=declared usa só o /meta (auth_unecessary) e não gera " +
+              "tráfego de escrita; mode=active confirma com POST de corpo vazio SEM token (efeito colateral mínimo, mas existe — por " +
+              "padrão só sonda os declarados públicos e ignora nomes destrutivos). Nunca envia o token do app.",
+            inputSchema: {
+              mode: z.enum(["declared", "active"]).default("declared").describe("declared = só o /meta (sem tráfego); active = confirma com POST anônimo"),
+              workflows: z.array(z.string().min(1)).optional().describe("Em mode=active: workflows a sondar (default: os declarados públicos)"),
+              include_sample: z.boolean().default(false).describe("true anexa a resposta mascarada do workflow"),
+              env: z.enum(["current", "test", "live", "both"]).default("current"),
+              concurrency: z.number().int().min(1).max(8).default(4),
+              allow_destructive: z.boolean().default(false).describe("true sonda também nomes que sugerem apagar/enviar/pagar"),
+            },
+            annotations: readOnly,
+          },
+          async (a) =>
+            run("bubble_workflow_exposure_audit", `workflows:${a.mode}`, async () => {
+              const design = normalizeDesign(await metaCached());
+              const declared = design.workflows.filter((w) => w.public).map((w) => w.name);
+              if (a.mode === "declared") {
+                const list = a.workflows ? declared.filter((n) => a.workflows!.includes(n)) : declared;
+                return {
+                  data: {
+                    mode: "declared",
+                    fonte: "/meta (auth_unecessary) — nenhuma requisição de escrita foi feita",
+                    total_workflows: design.workflows.length,
+                    publicos: list.length,
+                    workflows: list.map((n) => {
+                      const w = design.workflows.find((x) => x.name === n)!;
+                      return {
+                        name: w.name,
+                        method: w.method,
+                        params: w.params.map((p) => p.key),
+                        returns: Object.keys(w.returns),
+                      };
+                    }),
+                  },
+                  items: list.length,
+                };
+              }
+              const targets = a.workflows ?? declared;
+              const envs = a.env === "both" ? (["test", "live"] as const) : [resolveEnv(a.env, client.env)];
+              const results = [];
+              for (const env of envs) {
+                const apiRoot = apiRootFor(config.appUrl, env);
+                const sweep = await sweepAnonymousWorkflows({
+                  apiRoot,
+                  workflows: targets,
+                  concurrency: a.concurrency,
+                  includeSample: a.include_sample,
+                  allowDestructive: a.allow_destructive,
+                  http: client.httpOptions,
+                });
+                results.push({ ...sweep, apiRoot });
+              }
+              const leaks = results.flatMap((r) => r.leaks);
+              return {
+                data: {
+                  mode: "active",
+                  nota:
+                    "exposto = o workflow respondeu sem autenticação (401 do Bubble não apareceu). 400 também conta: o workflow foi " +
+                    "alcançado e só faltou payload — que o atacante também tem.",
+                  por_ambiente: results.map((r) => ({ apiRoot: r.apiRoot, sondados: r.probed, expostos: r.exposed })),
+                  total_expostos: leaks.length,
+                  vazamentos: leaks,
+                },
+                items: leaks.length,
+              };
+            }),
+        ),
+    },
   ];
+
+  // Tools de design (editor): só existem com credencial de conta + app alvo.
+  const hasEditor = !!(config.editorSession && config.editorAppId);
+  if (hasEditor) {
+    specs.push(
+      {
+        name: "bubble_editor_discover",
+        minMode: "read-only",
+        register: (s) =>
+          s.registerTool(
+            "bubble_editor_discover",
+            {
+              title: "Descobrir o design pelo editor",
+              description:
+                "Sonda o editor com a sessão da conta Bubble: confere se a credencial ainda vale, devolve a versão do design " +
+                "(last_change) e lista os nós da raiz (pages, element_definitions, api, styles, settings...) com o tamanho de cada " +
+                "subárvore. Serve para saber o que existe antes de ler ou escrever. Só lê.",
+              inputSchema: {},
+              annotations: readOnly,
+            },
+            async () =>
+              run("bubble_editor_discover", "editor", async () => {
+                const session = editorSession();
+                const d = await session.discover();
+                return {
+                  data: {
+                    ...d,
+                    operacoes_aprovadas: session.opNames(),
+                    codec: {
+                      descricao: "O editor guarda nomes reservados em forma curta com prefixo % (pages→%p3, name→%nm). " +
+                        "Este cliente encolhe o caminho e o valor antes de enviar — e desencolhe na leitura.",
+                      exemplo_path: "pages.AAW.properties.name → " + shrinkPath("pages.AAW.properties.name"),
+                    },
+                    proximo_passo:
+                      "Leia com bubble_editor_read (paths: [\"pages.AAW\", \"settings\"]) e escreva com bubble_editor_write " +
+                      "(path + value). Nada aqui altera o design.",
+                  },
+                  untrusted: false,
+                };
+              }),
+          ),
+      },
+      {
+        name: "bubble_editor_read",
+        minMode: "read-only",
+        register: (s) =>
+          s.registerTool(
+            "bubble_editor_read",
+            {
+              title: "Ler o design do app",
+              description:
+                "Lê nós do design do app alvo pelo editor, usando a operação aprovada em BUBBLE_EDITOR_OPS. Os paths são os " +
+                "nomes humanos do design (\"pages.AAW.properties.name\", \"settings\", \"api\") — o cliente encolhe antes de " +
+                "enviar e desencolhe o que volta. Nós grandes voltam como \"chunkKeys\" (a lista de filhos). Só lê.",
+              inputSchema: {
+                paths: z
+                  .array(z.string().min(1))
+                  .min(1)
+                  .default(["settings"])
+                  .describe("Caminhos do design, separados por ponto (\"pages.AAW\", \"settings\", \"api\")"),
+                children: z
+                  .number()
+                  .int()
+                  .min(0)
+                  .max(2)
+                  .default(0)
+                  .describe("Níveis a descer dentro dos nós grandes (0 = só o topo; 1 = traz os filhos de cada chunk)"),
+                expand: z.boolean().default(true).describe("true (padrão) devolve os nomes legíveis; false devolve a forma encolhida"),
+              },
+              annotations: readOnly,
+            },
+            async ({ paths, children, expand }) =>
+              run("bubble_editor_read", paths.join(","), async () => {
+                const session = editorSession();
+                const res = await session.readDesign(paths, { children, expand });
+                return {
+                  data: {
+                    last_change: res.lastChange,
+                    nos: res.nodes.map((n) => ({
+                      path: n.path,
+                      existe: n.missing ? false : n.data !== null || !!n.chunkKeys?.length,
+                      filhos: n.chunkKeys?.length,
+                      children: n.chunkKeys,
+                      data: n.data,
+                    })),
+                  },
+                  untrusted: false,
+                };
+              }),
+          ),
+      },
+    );
+  }
 
   specs.push(
     {
@@ -774,6 +1103,148 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
             ),
         ),
     },
+    {
+      name: "bubble_editor_write",
+      minMode: "admin",
+      register: (s) =>
+        s.registerTool(
+          "bubble_editor_write",
+          {
+            title: "Escrever no design do app",
+            description:
+              "Escreve um nó do design do app alvo (ou publica o branch) pelo editor, com a sessão da conta Bubble. " +
+              "path é o caminho humano do nó (\"pages.AAW.properties.<fieldId>\") e value o novo conteúdo — value=null apaga " +
+              "o nó, mode=merge junta com o que já está lá. Começa em dry-run e mostra o method/URL/body exatos; executar " +
+              "exige o plan_id. Depois relê o nó e só declara o efeito se a releitura confirmar. Só no modo admin. " +
+              "Publicar o branch de desenvolvimento já é um deploy do app público: exige BUBBLE_ALLOW_LIVE_WRITES=true.",
+            inputSchema: {
+              path: z.string().min(1).optional().describe("Caminho do nó (\"pages.AAW.properties.<fieldId>\"). Opcional só para publicar."),
+              value: z.unknown().optional().describe("Novo valor do nó. null apaga o nó."),
+              mode: z
+                .enum(["replace", "merge"])
+                .default("replace")
+                .describe("replace = substitui o valor; merge = junta as chaves de value no que já existe"),
+              op: z
+                .string()
+                .min(1)
+                .default("write_design")
+                .describe("Operação aprovada em BUBBLE_EDITOR_OPS (write_design para editar, publish_design para publicar)"),
+              verify: z
+                .enum(["design", "none"])
+                .default("design")
+                .describe("design = relê o nó alterado e compara; none = não confere"),
+              ...control,
+            },
+            annotations: { ...writeHints, destructiveHint: true },
+          },
+          async ({ path, value, mode, op, verify, dry_run, plan_id }) => {
+            const session = editorSession();
+            const publish = session.isPublishOp(op);
+            if (!publish && !path) {
+              throw new Error("Informe path: é o caminho do nó a escrever (ex.: \"pages.AAW.properties.<fieldId>\").");
+            }
+            if (!session.has(op)) {
+              throw new Error(
+                `Operação "${op}" não está no mapa aprovado. Disponíveis: ${session.opNames().join(", ") || "nenhuma"}.`,
+              );
+            }
+
+            // Monta a alteração efetiva (o merge precisa do valor atual).
+            const changes: EditorChange[] = publish
+              ? []
+              : mode === "merge" && value !== null && value !== undefined
+                ? await (async () => {
+                    const atual = (await currentValue(session, path!, true)) as Record<string, unknown>;
+                    const merged = { ...atual, ...(value as Record<string, unknown>) };
+                    return [
+                      {
+                        path: path!,
+                        value: merged,
+                        // A prévia mostra o valor final mascarado: o que veio do
+                        // design pode conter credencial de integração.
+                        previewValue: redactDesignSecrets(merged),
+                      },
+                    ];
+                  })()
+                : [{ path: path!, value: value ?? null }];
+
+            const plan = publish
+              ? {
+                  method: session.methodFor(op),
+                  endpoint: session.resolveUrlFor(op),
+                  summary: `PUBLICAR o branch ${config.editorBranch} do app ${config.editorAppId} — isso sobe o app público`,
+                  payload: { appname: config.editorAppId },
+                }
+              : (() => {
+                  const p = session.previewWrite(changes);
+                  return {
+                    method: p.method,
+                    endpoint: p.endpoint,
+                    summary:
+                      `Aplicar ${changes.length} alteração(ões) no design do app ${config.editorAppId} (branch ${config.editorBranch})` +
+                      (changes.some((c) => c.value === null) ? " — inclui apagar um nó" : ""),
+                    payload: p.body,
+                  };
+                })();
+
+            return write(
+              "bubble_editor_write",
+              publish ? "publish" : path!,
+              { op, path, value, mode },
+              { dry_run, plan_id },
+              plan,
+              async () => {
+                if (publish) {
+                  const resposta = await session.publish();
+                  return {
+                    data: {
+                      op,
+                      publicado: true,
+                      resposta: resumo(resposta),
+                      nota: "O branch de desenvolvimento foi publicado: o app público passou a servir este design.",
+                    },
+                    items: 1,
+                  };
+                }
+                const antes = verify === "design" ? await currentValue(session, path!).catch(() => undefined) : undefined;
+                const escrita = await session.writeDesign(changes);
+                if (verify === "none") {
+                  return {
+                    data: { op, aplicado: true, verificado: false, resposta: escrita, nota: "verify=none: o efeito não foi conferido" },
+                    items: 1,
+                  };
+                }
+                const depois = await currentValue(session, path!).catch(() => undefined);
+                const apagou = changes.some((c) => c.value === null);
+                // Compara com o valor mascarado: a releitura vem mascarada.
+                const esperado = redactDesignSecrets(
+                  changes[0]?.previewValue !== undefined ? changes[0].previewValue : (changes[0]?.value ?? null),
+                );
+                const verificado = apagou
+                  ? antes !== undefined && antes !== null && depois === null
+                  : canonicalJson(depois ?? null) === canonicalJson(esperado ?? null);
+                return {
+                  data: {
+                    op,
+                    aplicado: true,
+                    verificado,
+                    resposta: escrita,
+                    antes,
+                    depois,
+                    nota: verificado
+                      ? undefined
+                      : "a releitura não bateu com o que foi escrito — confira no editor antes de reenviar.",
+                  },
+                  items: 1,
+                };
+              },
+              () => {
+                assertEditorWriteAllowed(op);
+              },
+            );
+          },
+        ),
+    },
   );
 
   const registered: string[] = [];
@@ -790,6 +1261,39 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
 /** Projeção: sempre devolve `_id` + só os campos pedidos (campo ausente vira null). */
 function pick(fields: string[], record: Record<string, unknown>): Record<string, unknown> {
   return { _id: record._id, ...Object.fromEntries(fields.map((f) => [f, record[f] ?? null])) };
+}
+
+/**
+ * Valor atual de um nó do design.
+ *
+ * O editor devolve o nó pedido; quando o nó é uma entrada dentro de um pai
+ * grande, a releitura cai para o pai e pega a chave — para a verificação de
+ * escrita comparar o mesmo caminho antes e depois.
+ *
+ * `raw` lê sem mascarar segredo: só o merge usa, porque precisa do valor de
+ * verdade para reescrever o nó. Quem chama precisa devolver esse valor
+ * mascarado em qualquer saída.
+ */
+async function currentValue(session: BubbleEditorSession, path: string, raw = false): Promise<unknown> {
+  const opts = raw ? { secrets: "raw" as const } : {};
+  const node = await session.readNode(path, opts);
+  if (node.data !== null && node.data !== undefined) return node.data;
+  const parts = path.split(".");
+  if (parts.length > 1) {
+    const parent = parts.slice(0, -1).join(".");
+    const last = parts[parts.length - 1]!;
+    const p = await session.readNode(parent, opts);
+    if (p.data && typeof p.data === "object" && last in (p.data as Record<string, unknown>)) {
+      return (p.data as Record<string, unknown>)[last];
+    }
+  }
+  return null;
+}
+
+/** Resposta de escrita truncada, para não despejar o design inteiro no contexto. */
+function resumo(value: unknown): unknown {
+  const raw = JSON.stringify(value) ?? "null";
+  return raw.length > 2000 ? { truncado: raw.slice(0, 2000) } : (value ?? null);
 }
 
 function resolveEnv(requested: "current" | "test" | "live", current: BubbleEnv): BubbleEnv {

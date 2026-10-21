@@ -48,6 +48,8 @@ export interface RequestInitLike {
   contentType?: string;
   /** `text` devolve o corpo cru (o /bulk responde text/plain, uma linha por item). */
   responseType?: "json" | "text";
+  /** Headers extras (ex.: Cookie de sessão do editor). Sobrepõem os padrão. */
+  headers?: Record<string, string>;
 }
 
 export async function requestJson<T = unknown>(url: string, init: RequestInitLike, opts: HttpOptions = {}): Promise<T> {
@@ -62,6 +64,7 @@ export async function requestJson<T = unknown>(url: string, init: RequestInitLik
 
   const headers: Record<string, string> = { Accept: init.responseType === "text" ? "text/plain, application/json" : "application/json" };
   if (init.token) headers.Authorization = `Bearer ${init.token}`;
+  Object.assign(headers, init.headers ?? {});
   const payload = init.rawBody !== undefined ? init.rawBody : init.body === undefined ? undefined : JSON.stringify(init.body);
   if (payload !== undefined) headers["Content-Type"] = init.contentType ?? "application/json";
 

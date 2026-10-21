@@ -10,7 +10,12 @@ import { BubbleClient } from "../src/core/client.js";
 import { createBubbleMcpServer, fitToCap, InflightLimiter, MAX_OUTPUT_CHARS } from "../src/mcp/server.js";
 import { fakeBubble, makeRows } from "./fake-bubble.js";
 
-async function connect(mode: Mode = "read-only", token?: string, allowlist?: string) {
+async function connect(
+  mode: Mode = "read-only",
+  token?: string,
+  allowlist?: string,
+  editor?: { session?: string; appId?: string; ops?: string },
+) {
   const dir = await mkdtemp(join(tmpdir(), "bb-mcp-"));
   const config = loadConfig({
     BUBBLE_APP_URL: "https://meuapp.bubbleapps.io",
@@ -19,6 +24,9 @@ async function connect(mode: Mode = "read-only", token?: string, allowlist?: str
     BUBBLE_AUDIT_LOG: join(dir, "audit.jsonl"),
     ...(token ? { BUBBLE_API_TOKEN: token } : {}),
     ...(allowlist ? { BUBBLE_WORKFLOW_ALLOWLIST: allowlist } : {}),
+    ...(editor?.session ? { BUBBLE_EDITOR_SESSION: editor.session } : {}),
+    ...(editor?.appId ? { BUBBLE_EDITOR_APP_ID: editor.appId } : {}),
+    ...(editor?.ops ? { BUBBLE_EDITOR_OPS: editor.ops } : {}),
   });
   const fake = fakeBubble({ pedido: makeRows(250) }, token ? { token } : {});
   const bubble = new BubbleClient({ appUrl: config.appUrl, env: config.env, token: config.token, fetch: fake.fetch, sleep: async () => undefined });
@@ -41,9 +49,11 @@ describe("servidor MCP", () => {
       "bubble_anonymous_read",
       "bubble_config",
       "bubble_data_export",
+      "bubble_design_read",
       "bubble_exposure_audit",
       "bubble_query",
       "bubble_schema",
+      "bubble_workflow_exposure_audit",
     ]);
     for (const t of tools) expect(t.annotations?.readOnlyHint === true).toBe(t.name !== "bubble_data_export");
   });
@@ -224,5 +234,78 @@ describe("servidor MCP", () => {
       ),
     );
     expect(peak).toBe(2);
+  });
+});
+
+describe("tools de design e de exposição de workflows", () => {
+  it("bubble_design_read devolve o contrato de design lido do /meta", async () => {
+    const { mcp } = await connect();
+    const res = await mcp.callTool({ name: "bubble_design_read", arguments: { action: "list_types" } });
+    const data = res.structuredContent as { types: Array<{ name: string }>; total: number };
+    expect(data.total).toBe(1);
+    expect(data.types[0]!.name).toBe("pedido");
+
+    const wf = await mcp.callTool({ name: "bubble_design_read", arguments: { action: "list_workflows" } });
+    const wfd = wf.structuredContent as { publicos: number; workflows: Array<{ name: string; public: boolean }> };
+    expect(wfd.publicos).toBe(1);
+    expect(wfd.workflows.find((w) => w.name === "admin")!.public).toBe(true);
+  });
+
+  it("bubble_workflow_exposure_audit em modo declared não gera tráfego de escrita", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bb-wf-"));
+    const config = loadConfig({
+      BUBBLE_APP_URL: "https://meuapp.bubbleapps.io",
+      BUBBLE_MODE: "read-only",
+      BUBBLE_API_TOKEN: "t",
+      BUBBLE_EXPORT_DIR: join(dir, "exports"),
+    });
+    const fake = fakeBubble({ pedido: makeRows(2) }, { token: "t", publicWorkflows: ["admin"] });
+    const bubble = new BubbleClient({ appUrl: config.appUrl, env: config.env, token: config.token, fetch: fake.fetch });
+    const { server } = createBubbleMcpServer({ config, client: bubble, audit: new AuditLog(config.auditLog) });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    const mcp = new Client({ name: "teste", version: "0" });
+    await Promise.all([server.connect(a), mcp.connect(b)]);
+
+    const res = await mcp.callTool({ name: "bubble_workflow_exposure_audit", arguments: { mode: "declared" } });
+    const data = res.structuredContent as { publicos: number };
+    expect(data.publicos).toBe(1);
+    expect(fake.writes).toHaveLength(0);
+
+    const active = await mcp.callTool({ name: "bubble_workflow_exposure_audit", arguments: { mode: "active" } });
+    const ad = active.structuredContent as { total_expostos: number };
+    expect(ad.total_expostos).toBe(1);
+  });
+
+  it("publicar o branch dev é recusado sem BUBBLE_ALLOW_LIVE_WRITES, mesmo em dry-run", async () => {
+    const { mcp } = await connect("admin", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "app-123",
+      ops: '{"write_design":{"method":"POST","path":"/wf/save"},"publish":{"method":"POST","path":"/wf/publish_branch"}}',
+    });
+    const res = await mcp.callTool({ name: "bubble_editor_write", arguments: { op: "publish" } });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/publish/i);
+    expect(text(res)).toMatch(/BUBBLE_ALLOW_LIVE_WRITES=true/);
+  });
+
+  it("as tools de editor só existem com sessão de conta, e a escrita só no modo admin", async () => {
+    const semSessao = await connect("admin");
+    expect(semSessao.tools).not.toContain("bubble_editor_read");
+
+    const comSessao = await connect("read-only", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "app-123",
+      ops: '{"read_design":{"method":"GET","path":"/wf/load"}}',
+    });
+    expect(comSessao.tools).toContain("bubble_editor_discover");
+    expect(comSessao.tools).toContain("bubble_editor_read");
+    expect(comSessao.tools).not.toContain("bubble_editor_write");
+
+    const admin = await connect("admin", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "app-123",
+      ops: '{"read_design":{"method":"GET","path":"/wf/load"}}',
+    });
+    expect(admin.tools).toContain("bubble_editor_write");
   });
 });
