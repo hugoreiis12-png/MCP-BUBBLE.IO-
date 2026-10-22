@@ -41,6 +41,18 @@ node dist/cli.js clients revoke hugo-opencode                  # vale na próxim
   responde 500 e nunca libera acesso.
 - `bubble_data_export` e `bubble_editor_export` não aparecem para client remoto, porque o arquivo seria gravado no disco da VM.
 
+### Plano de design (editor)
+
+As tools de editor só aparecem com `BUBBLE_EDITOR_SESSION` **e** `BUBBLE_EDITOR_APP_ID` preenchidos
+na stack. Defina também `BUBBLE_EDITOR_FIREBASE_TOKEN`: sem ele, a escrita de design volta 401.
+
+- `bubble_editor_discover` e `bubble_editor_read` funcionam a partir de `read-only`.
+- `bubble_editor_write` exige **admin** dos dois lados: `BUBBLE_MODE=admin` na stack e o client
+  criado com `clients add <nome> --mode admin`.
+- A sessão alcança todos os apps editáveis da conta. Quando ela expirar, atualize a variável no
+  Portainer e faça o redeploy da stack.
+- Se usar `BUBBLE_EDITOR_OPS` como arquivo, coloque-o no volume, por exemplo em `/data/editor-ops.json`.
+
 ## 3. Conectar os clients
 
 Troque `vm-interna` pelo IP ou hostname da VM e `TOKEN` pelo valor que o `clients add` imprimiu.

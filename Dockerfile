@@ -8,7 +8,7 @@ RUN npm run build
 
 FROM node:22-slim AS runtime
 ENV NODE_ENV=production \
-    BUBBLE_BRIDGE_HTTP_HOST=192.168.0.160\
+    BUBBLE_BRIDGE_HTTP_HOST=0.0.0.0 \
     BUBBLE_BRIDGE_HTTP_PORT=8787 \
     BUBBLE_BRIDGE_CLIENTS_FILE=/data/clients.json \
     BUBBLE_AUDIT_LOG=/data/logs/audit.jsonl \
