@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classify, levelOf, probeAnonymous, redactSample, sweepAnonymous } from "../src/core/recon.js";
+import { classify, levelOf, probeAnonymous, redactSample, sweepAnonymous, sweepAnonymousWorkflows } from "../src/core/recon.js";
 import type { FetchLike } from "../src/core/http.js";
 
 const API = "https://meuapp.bubbleapps.io/version-test/api/1.1";
@@ -130,6 +130,52 @@ describe("probeAnonymous", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]!.auth).toBeUndefined();
     expect(seen[0]!.url).toContain("limit=");
+  });
+});
+
+describe("sweep de workflows públicos", () => {
+  const statusFetch = (status: number): FetchLike =>
+    async () =>
+      new Response(JSON.stringify({ statusCode: status, message: "x" }), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+
+  it("404 e 405 não contam como exposto — o endpoint não existe nesse app", async () => {
+    const r = await sweepAnonymousWorkflows({
+      apiRoot: API,
+      workflows: ["nao_existe", "metodo_errado"],
+      http: { fetch: statusFetch(404) },
+    });
+    expect(r.exposed).toBe(0);
+    expect(r.leaks).toHaveLength(0);
+  });
+
+  it("401 significa protegido; 400 prova alcance", async () => {
+    const protegido = await sweepAnonymousWorkflows({
+      apiRoot: API,
+      workflows: ["login"],
+      http: { fetch: statusFetch(401) },
+    });
+    expect(protegido.exposed).toBe(0);
+
+    const alcancado = await sweepAnonymousWorkflows({
+      apiRoot: API,
+      workflows: ["admin"],
+      http: { fetch: statusFetch(400) },
+    });
+    expect(alcancado.exposed).toBe(1);
+  });
+
+  it("cruza a lista de públicos declarados no /meta com o que foi sondado", async () => {
+    const r = await sweepAnonymousWorkflows({
+      apiRoot: API,
+      workflows: ["admin", "login"],
+      declaredPublic: ["admin", "outro"],
+      http: { fetch: statusFetch(400) },
+    });
+    // Só os que estavam na lista e foram sondados entram no cruzamento.
+    expect(r.declaredPublic).toEqual(["admin"]);
   });
 });
 

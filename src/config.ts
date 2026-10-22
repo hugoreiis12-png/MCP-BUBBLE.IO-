@@ -72,6 +72,14 @@ const ConfigSchema = z.object({
    */
   editorSession: z.string().min(1).optional(),
   /**
+   * JWT do Firebase da conta Bubble (`meta-firebase_workflow`).
+   *
+   * O editor exige **os dois**: o cookie da sessão e este header. Sem o
+   * header, o editor responde 401 mesmo com o cookie válido — é o motivo
+   * mais comum de a escrita de design falhar.
+   */
+  editorFirebaseToken: z.string().min(1).optional(),
+  /**
    * Base HTTP do **editor** — o host que serve o editor e a API interna de
    * design (`/appeditor/*`). É diferente do host da API do app (`/api/1.1`).
    */
@@ -136,6 +144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     allowLiveWrites: env.BUBBLE_ALLOW_LIVE_WRITES || undefined,
     workflowAllowlist: env.BUBBLE_WORKFLOW_ALLOWLIST || undefined,
     editorSession: env.BUBBLE_EDITOR_SESSION || undefined,
+    editorFirebaseToken: env.BUBBLE_EDITOR_FIREBASE_TOKEN || undefined,
     editorBase: env.BUBBLE_EDITOR_BASE || env.BUBBLE_EDITOR_API_BASE || undefined,
     editorApiBase: env.BUBBLE_EDITOR_API_BASE || undefined,
     editorAppId: env.BUBBLE_EDITOR_APP_ID || undefined,
@@ -171,6 +180,9 @@ export function redactedConfig(cfg: BridgeConfig): Record<string, unknown> {
     workflowAllowlist: cfg.workflowAllowlist,
     editor: {
       sessao: cfg.editorSession ? `definida (${cfg.editorSession.length} caracteres)` : "ausente — tools de design ficam indisponíveis",
+      firebase: cfg.editorFirebaseToken
+        ? `definido (${cfg.editorFirebaseToken.length} caracteres)`
+        : "ausente — o editor exige o header meta-firebase_workflow; sem ele a escrita de design é recusada com 401",
       base: cfg.editorBase,
       app: cfg.editorAppId ?? "ausente",
       version: editorAppVersion(cfg),

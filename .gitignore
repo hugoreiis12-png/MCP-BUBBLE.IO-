@@ -7,3 +7,6 @@ logs/
 bubble-types.ts
 build/
 clients.json
+# Artefatos de ferramentas de segurança externas — não pertencem a este projeto
+security_config.json
+security_audits/

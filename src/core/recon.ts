@@ -225,7 +225,11 @@ export async function probeAnonymousWorkflow(opts: WorkflowProbeOptions): Promis
   } catch (err) {
     const status = typeof (err as { status?: number }).status === "number" ? (err as { status: number }).status : 0;
     const message = err instanceof BubbleApiError ? err.bubbleMessage : err instanceof Error ? err.message : String(err);
-    const exposed = status !== 401 && status !== 0;
+    // 401 = exige autenticação (workflow protegido). 404/405 = o endpoint não
+    // existe nesse app ou não aceita o método — não prova alcance, e contá-lo
+    // como exposto gera falso positivo no relatório. 400 e 500 contam: o
+    // workflow foi alcançado e só faltou payload — que o atacante também tem.
+    const exposed = status !== 0 && status !== 401 && status !== 404 && status !== 405;
     return {
       ...base,
       status,
@@ -247,6 +251,8 @@ export interface WorkflowSweepOptions {
   http?: HttpOptions;
   /** Ignora o filtro de nomes destrutivos (exige lista explícita do operador). */
   allowDestructive?: boolean;
+  /** Workflows que o /meta declara públicos — volta no resultado, para cruzar as duas fontes. */
+  declaredPublic?: string[];
 }
 
 export interface WorkflowSweepResult {
@@ -287,7 +293,7 @@ export async function sweepAnonymousWorkflows(opts: WorkflowSweepOptions): Promi
     apiRoot: opts.apiRoot,
     probed: targets.length,
     exposed: leaks.length,
-    declaredPublic: [],
+    declaredPublic: (opts.declaredPublic ?? []).filter((w) => targets.includes(w)),
     leaks,
     errors,
   };

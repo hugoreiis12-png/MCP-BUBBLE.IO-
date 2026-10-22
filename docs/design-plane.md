@@ -1,8 +1,9 @@
 # Plano de design do Bubble: leitura, escrita e o que a credencial alcança
 
 Documento de referência do `bubble_design_read`, `bubble_editor_discover`,
-`bubble_editor_read` e `bubble_editor_write`. Tudo aqui foi verificado contra o
-app real em 2026-10-21 (branch `version-test` do app `comprover`).
+`bubble_editor_read`, `bubble_editor_export` e `bubble_editor_write`. Tudo aqui
+foi verificado contra o app real em 2026-10-21 (branch `version-test` do app
+`comprover`).
 
 ---
 
@@ -57,13 +58,19 @@ O token é **escopado ao tenant**: ele lê e grava dados do app, mas a plataform
 recusa o mesmo token no plano dela. Não é um bug de configuração — é a
 separação de escopos do Bubble.
 
+> O host de `/appeditor/*` (o editor de verdade) é outro — por padrão
+> `https://scheduled.bubble.io`, configurável em `BUBBLE_EDITOR_BASE`. A API do
+> *app* (`/api/1.1`) e a do *editor* (`/appeditor`) moram em hosts diferentes.
+
 ### 2.3 O que alcança o design: a sessão da conta
 
-O editor é um app interno da Bubble (`editor.bubbleapps.io`). O que o alcança é a
-**sessão da conta Bubble**, não um token de app:
+O editor é um app interno da Bubble. O que o alcança é a **sessão da conta
+Bubble**, não um token de app — e são **dois** credenciais, não um:
 
 - cookie `meta_live_u2main` (conta de produção) ou `meta_test_u2main` (dev);
 - header `meta-firebase_workflow` com o JWT do Firebase.
+
+Falta qualquer um dos dois e a resposta é 401.
 
 > **Raio de impacto:** essa sessão concede leitura e escrita de design sobre
 > **todos os apps que a conta puder editar** — não só o app alvo. É uma
@@ -78,23 +85,65 @@ O editor é um app interno da Bubble (`editor.bubbleapps.io`). O que o alcança 
 A API do editor é interna, não documentada e muda sem aviso. O Bridge não
 adivinha endpoint: ele executa um **mapa de operações** que o operador aprova.
 
-```bash
-BUBBLE_EDITOR_OPS='{
-  "read_design":  {"method":"GET",  "path":"/wf/load_app_design"},
-  "write_design": {"method":"POST", "path":"/wf/save_app_design"}
-}'
+O protocolo real foi **medido no editor** (não é documentação do Bubble) e o
+Bridge o traz como mapa padrão — sobrescrevível por `BUBBLE_EDITOR_OPS`:
+
+```json
+{
+  "read_design":    {"method":"POST","path":"/appeditor/load_multiple_paths/{app}/{version}"},
+  "probe_design":   {"method":"GET", "path":"/appeditor/load_single_path/{app}/{version}/no_version_hash/_index"},
+  "write_design":   {"method":"POST","path":"/appeditor/write"},
+  "export_design":  {"method":"GET", "path":"/appeditor/export/{version}/{app}.bubble"},
+  "changes":        {"method":"GET", "path":"/appeditor/changes/{app}/{version}/{since}/{session}"},
+  "publish_design": {"method":"POST","path":"/appeditor/deploy_new_code"}
+}
 ```
 
-- o caminho aceita os placeholders `{app_id}` e `{branch}`;
-- o corpo enviado é `{app_id, branch, ...payload}` — o payload do agente entra
-  inteiro, sem template escondido;
-- `bubble_editor_discover` (ou `bubble-bridge editor discover`) sonda o schema
-  do app interno do editor e devolve os workflows candidatos a leitura e a
-  escrita de design, para montar esse mapa.
+- o caminho aceita os placeholders `{app}` (appname), `{version}` (`test`/`live`),
+  `{since}`, `{session}` e `{path}` (caminho encolhido);
+- o corpo da escrita é `{v:1, appname, app_version, changes:[{body, path_array,
+  metadata, session_id}]}` — o payload do agente entra inteiro, sem template
+  escondido;
+- **`BUBBLE_EDITOR_OPS` sobrescreve o mapa inteiro** (inclusive para reduzir o
+  conjunto: omitir uma operação a desliga). O valor pode ser o JSON inline ou o
+  caminho de um arquivo com o JSON;
+- `bubble_editor_discover` (ou `bubble-bridge editor discover`) **mapeia a raiz do
+  design** — os nós (`pages`, `element_definitions`, `api`, `styles`, `settings`…)
+  com a contagem de filhos de cada um — e devolve as operações aprovadas. É o
+  que responde "o que existe no app e o que dá para ler"; os *endpoints* do
+  editor já são o mapa padrão acima.
 
 **Falha fechada:** sem `BUBBLE_EDITOR_SESSION` + `BUBBLE_EDITOR_APP_ID` as
 tools de editor nem são registradas; sem uma operação no mapa, a chamada é
 recusada com a lista do que existe.
+
+### 3.0 O editor exige duas credenciais
+
+O cookie da conta **e** o header `meta-firebase_workflow` (JWT do Firebase):
+
+```bash
+BUBBLE_EDITOR_SESSION='meta_test_u2main=…'
+BUBBLE_EDITOR_FIREBASE_TOKEN='eyJhbGciOi…'
+```
+
+Com o cookie válido e sem o header, a resposta é **401** — é o motivo mais
+comum de a escrita de design falhar. Os dois credenciais ficam fora do log de
+auditoria e fora do `bubble_config` (que só diz se estão definidos).
+
+A base do editor (`BUBBLE_EDITOR_BASE`, padrão `https://scheduled.bubble.io`) é
+o host de `/appeditor/*` — **não** o host da API do app (`/api/1.1`). São hosts
+diferentes: a API do app e a do editor não se misturam.
+
+### 3.1 Caminhos encolhidos ("shrunk")
+
+O editor guarda nomes reservados em forma curta com prefixo `%`: `pages` → `%p3`,
+`elements` → `%el`, `name` → `%nm`, `properties` → `%p`, `type` → `%x`. O
+caminho vai encolhido **e o valor vai encolhido** — o servidor guarda o corpo
+exatamente como ele chega, então mandar `{"name": "x"}` criaria um campo
+diferente do que o editor entende. O Bridge encolhe na ida e desencolhe na
+volta: o agente vê e escreve na forma humana (`pages.AAW.properties.<fieldId>`).
+
+Apagar um nó é escrever `body: null` no mesmo caminho.
 
 ### 3.1 Deploy: publicar é escrever no live, mesmo no branch de dev
 
@@ -122,13 +171,38 @@ comparar campo a campo. A verificação é estrutural:
 
 | `verify` | Como confere | Quando a mudança aparece |
 | --- | --- | --- |
-| `design` (padrão) | relê o documento de design e faz diff de caminhos | imediatamente, se o editor persistiu |
-| `schema` | relê o `/meta` e faz diff do contrato | **só depois de publicar o branch** |
+| `design` (padrão) | relê o nó alterado e compara com o que foi escrito (JSON canônico) | imediatamente, se o editor persistiu |
+| `schema` | relê o `/meta` e faz diff do contrato (tipos, campos e workflows) | **só depois de publicar o branch** |
 | `none` | não confere | — |
 
 O diff do documento cru (`diffDesignJson`) é limitado (8 níveis, 300 entradas)
 e devolve caminhos adicionados, removidos e alterados — o suficiente para dizer
 "a escrita mudou alguma coisa" sem despejar o design inteiro no contexto.
+
+O `verify=schema` devolve `schema_diff` com `tipos_adicionados`,
+`tipos_removidos`, `campos_adicionados`, `campos_removidos`,
+`workflows_adicionados` e `workflows_removidos`. Quando o `/meta` não muda, a
+resposta diz por quê: *"/meta reflete apenas o branch publicado — se a escrita
+foi no branch de desenvolvimento, o diff só aparece depois de publicar"*.
+
+---
+
+## 4.1 O export do design (a entrada do Motor 2)
+
+O `.bubble` que o editor exporta é a **única fonte** do formato de design que o
+Bubble aceita:
+
+```bash
+node dist/cli.js editor export                  # → $BUBBLE_EXPORT_DIR/design/*.bubble
+node dist/cli.js editor export --out app.bubble # → e também num caminho escolhido
+```
+
+Via MCP: `bubble_editor_export` — grava o arquivo e devolve só metadados
+(`file`, `bytes`, `sha256`) mais um `head` opcional do começo. O design não é
+despejado no contexto.
+
+O arquivo é a entrada do compilador TS → `.bubble` (Motor 2): guarde-o
+versionado, porque o formato evolui junto com o editor.
 
 ---
 
@@ -226,15 +300,17 @@ curl -sS -X POST -H "Authorization: Bearer $BUBBLE_API_TOKEN" \
 ## 7. O que continua em aberto
 
 - [ ] **O transporte de escrita de design não foi validado end-to-end**: falta o
-      cookie da conta para executar `bubble_editor_write` contra o app real. A
-      hipótese de trabalho é que a API do app interno do editor abre para conta
-      autenticada; `bubble_editor_discover` é quem responde isso.
-- [ ] **Os endpoints do editor não são públicos.** O mapa `BUBBLE_EDITOR_OPS` é
-      preenchido pelo `discover`; até lá, `bubble_editor_read/write` falham
-      fechado com a lista do que está aprovado.
+      cookie da conta e o JWT do Firebase para executar `bubble_editor_write`
+      contra o app real. O protocolo foi medido no editor, mas o ciclo completo
+      (escrever → reler → publicar → `verify=schema`) ainda não rodou.
+- [ ] **O `editor export` ainda não rodou contra o app real** — é o `.bubble` que
+      serve de referência para o Motor 2.
 - [ ] **`/meta` só reflete o branch publicado.** Uma escrita de design só
       aparece no contrato depois de publicar — por isso `verify=design` (releitura
-      do documento) é o padrão, e `verify=schema` vem com a ressalva.
+      do nó) é o padrão, e `verify=schema` vem com a ressalva.
 - [ ] **O blast radius da sessão é a conta inteira.** Se o objetivo for abrir
       esse caminho para mais gente, a sessão precisa ser escopada por app —
       hoje não é.
+- [ ] **O `api` do design é grande.** Centenas de workflows em poucos MB: a
+      descoberta mapeia a raiz com `no_chunking: false` (lista de filhos, sem
+      baixar o nó inteiro), mas a leitura completa de `api` ainda não foi feita.

@@ -46,10 +46,16 @@ function sortKeys(v: unknown): unknown {
   return v;
 }
 
-/** Identificador do plano: hash de ferramenta + ambiente + app + argumentos. */
-export function planId(tool: string, client: BubbleClient, args: unknown): string {
+/**
+ * Identificador do plano: hash de ferramenta + ambiente + app + argumentos.
+ *
+ * `scope` amarra o plano a quem o emitiu — no transporte HTTP, o nome do
+ * client. Sem isso, um client autorizado poderia executar o plano emitido por
+ * outro (o `plan_id` é determinístico: os mesmos argumentos dão o mesmo id).
+ */
+export function planId(tool: string, client: BubbleClient, args: unknown, scope = "local"): string {
   return createHash("sha256")
-    .update(canonicalJson({ tool, api: client.apiRoot, args }))
+    .update(canonicalJson({ tool, api: client.apiRoot, scope, args }))
     .digest("hex")
     .slice(0, 16);
 }
@@ -97,7 +103,8 @@ export function verifyPlan(expected: string, received: string | undefined): void
   }
   if (received !== expected) {
     throw new WriteRefused(
-      "plan_id não corresponde aos argumentos atuais: o payload mudou desde a revisão. Gere um novo plano com dry_run=true.",
+      "plan_id não corresponde aos argumentos atuais: o payload mudou desde a revisão, ou o plano foi emitido por outro " +
+        "client. Gere um novo plano com dry_run=true.",
     );
   }
   const exp = plans.get(received);

@@ -228,19 +228,95 @@ describe("sessão do editor", () => {
     expect(chamadas).toBe(0);
   });
 
-  it("probe diz se a sessão da conta ainda responde", async () => {
-    const ok = session({}, async () => new Response(JSON.stringify({ path_version_hash: "abc" }), { status: 200 }));
+  it("probe diz se a sessão da conta ainda responde, usando a operação aprovada", async () => {
+    let url = "";
+    const fetchImpl: FetchLike = async (u) => {
+      url = u;
+      return new Response(JSON.stringify({ path_version_hash: "abc" }), { status: 200 });
+    };
+    const ok = realSession(fetchImpl);
     const p1 = await ok.probe();
     expect(p1.reachable).toBe(true);
     expect(p1.pathVersionHash).toBe("abc");
+    expect(url).toContain("/appeditor/load_single_path/comprover/test");
 
-    const expirada = session({}, async () =>
+    const expirada = realSession(async () =>
       new Response(JSON.stringify({ error_class: "Unauthorized", translation: "Session expired" }), { status: 401 }),
     );
     const p = await expirada.probe();
     expect(p.reachable).toBe(false);
     expect(p.status).toBe(401);
     expect(p.error).toMatch(/401/);
+  });
+
+  it("sem operação de sondagem aprovada, o probe falha fechado em vez de adivinhar URL", async () => {
+    const s = session({}, async () => new Response("{}", { status: 200 }));
+    const p = await s.probe();
+    expect(p.reachable).toBe(false);
+    expect(p.error).toMatch(/nenhuma operação de sondagem/);
+  });
+
+  it("manda o header do Firebase além do cookie — o editor exige os dois", async () => {
+    const headers: Array<Record<string, string>> = [];
+    const fetchImpl: FetchLike = async (_u, init) => {
+      headers.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(JSON.stringify({ last_change: "9" }), { status: 200 });
+    };
+    const s = new BubbleEditorSession({
+      session: "meta_test_u2main=abc",
+      firebaseToken: "jwt-firebase",
+      appId: "comprover",
+      appVersion: "test",
+      base: "https://scheduled.bubble.io",
+      http: { fetch: fetchImpl },
+    });
+    await s.writeDesign([{ path: "settings.x", value: 1 }]);
+    await s.probe();
+    expect(headers.length).toBe(2);
+    for (const h of headers) {
+      expect(h["Cookie"]).toBe("meta_test_u2main=abc");
+      expect(h["meta-firebase_workflow"]).toBe("jwt-firebase");
+    }
+  });
+
+  it("sem o header do Firebase, a requisição leva só o cookie", async () => {
+    const headers: Array<Record<string, string>> = [];
+    const fetchImpl: FetchLike = async (_u, init) => {
+      headers.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response("{}", { status: 200 });
+    };
+    const s = realSession(fetchImpl);
+    await s.writeDesign([{ path: "settings.x", value: 1 }]);
+    expect(headers[0]!["Cookie"]).toBe("meta_live_u2main=abc");
+    expect(headers[0]!["meta-firebase_workflow"]).toBeUndefined();
+  });
+
+  it("a descoberta mapeia a raiz sem baixar o nó api inteiro", async () => {
+    const bodies: any[] = [];
+    const fetchImpl: FetchLike = async (_u, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      // O editor responde com a lista de filhos quando o pedido é sem chunking.
+      return new Response(JSON.stringify({ last_change: "9", data: [{ keys: ["AAW"] }, { keys: ["wf1"] }] }), { status: 200 });
+    };
+    const s = realSession(fetchImpl);
+    const d = await s.discover();
+    const leitura = bodies.find((b) => Array.isArray(b.path_arrays));
+    expect(leitura!.no_chunking).toBe(false);
+    expect(d.reachable).toBe(true);
+    // A raiz responde com os filhos, não com o conteúdo.
+    expect(d.roots.some((r) => r.path === "api")).toBe(true);
+  });
+
+  it("exporta o design inteiro pelo editor", async () => {
+    let url = "";
+    const fetchImpl: FetchLike = async (u) => {
+      url = u;
+      return new Response("{\"pages\":{}}", { status: 200 });
+    };
+    const s = realSession(fetchImpl);
+    const raw = await s.exportDesign();
+    expect(url).toBe("https://scheduled.bubble.io/appeditor/export/test/comprover.bubble");
+    expect(raw).toContain("pages");
   });
 
   it("reconhece operação de publish: publicar o branch dev já é deploy no live", () => {

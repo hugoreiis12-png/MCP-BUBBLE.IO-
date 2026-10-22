@@ -1,7 +1,8 @@
 import { createWriteStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
+import { createHash } from "node:crypto";
 import type { BubbleClient } from "./client.js";
 import { exportAll, type ExportOptions, type ExportResult } from "./export.js";
 
@@ -43,4 +44,30 @@ export async function exportToNdjson(
     await rm(file, { force: true }); // não deixa export parcial passar por completo
     throw err;
   }
+}
+
+/**
+ * Grava o design exportado pelo editor (o arquivo `.bubble`).
+ *
+ * É a entrada do Motor 2 (compilador TS → `.bubble`): o export real do app é
+ * a única fonte que descreve o formato de design que o Bubble aceita.
+ * Fica em texto claro no disco, como os exports de dados — o diretório é
+ * ignorado pelo git.
+ */
+export async function writeDesignExport(
+  content: string,
+  exportDir: string,
+  appId: string,
+  version: string,
+): Promise<{ file: string; bytes: number; sha256: string }> {
+  const dir = resolve(exportDir, "design");
+  await mkdir(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = join(dir, `${safeSegment(appId)}-${safeSegment(version)}-${stamp}.bubble`);
+  await writeFile(file, content, { encoding: "utf8", mode: 0o600 });
+  return {
+    file,
+    bytes: Buffer.byteLength(content, "utf8"),
+    sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+  };
 }

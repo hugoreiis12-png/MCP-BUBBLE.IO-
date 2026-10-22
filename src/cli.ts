@@ -6,7 +6,7 @@ import { loadConfig, redactedConfig, type BridgeConfig } from "./config.js";
 import { AuditLog } from "./core/audit.js";
 import { BubbleClient, type Constraint } from "./core/client.js";
 import { generateTypes } from "./core/codegen.js";
-import { exportToNdjson } from "./core/files.js";
+import { exportToNdjson, writeDesignExport } from "./core/files.js";
 import { normalizeSwagger } from "./core/schema.js";
 import { createBubbleMcpServer, SERVER_VERSION } from "./mcp/server.js";
 import { runClients } from "./cli-clients.js";
@@ -30,6 +30,7 @@ Comandos
   design [--type T]             Contrato de design do app (/meta): tipos, ids internos, workflows
   editor discover               Sonda o editor: sessão, versão do design e nós da raiz
   editor read --path P          Lê um nó do design (--children N desce N níveis)
+  editor export [--out arq]     Exporta o design inteiro (.bubble) — a referência do formato
   editor write --path P --value JSON [--execute]
                                 Escreve/apaga um nó do design (sem --execute é só dry-run)
   serve --http [--host H] [--port N]
@@ -49,6 +50,7 @@ Configuração por variáveis de ambiente (ou .env no diretório atual):
 
   Plano de design (editor) — opcional:
   BUBBLE_EDITOR_SESSION  cookie da conta Bubble (meta_test_u2main / meta_live_u2main)
+  BUBBLE_EDITOR_FIREBASE_TOKEN  JWT do Firebase (header meta-firebase_workflow) — exigido pelo editor
   BUBBLE_EDITOR_APP_ID   appname do app alvo (ex.: comprover)
   BUBBLE_EDITOR_BRANCH   version-test | version-live        (padrão: version-test)
   BUBBLE_EDITOR_BASE     base do editor                     (padrão: https://scheduled.bubble.io)
@@ -142,6 +144,7 @@ async function main(argv: string[]): Promise<number> {
     }
     const session = new BubbleEditorSession({
       session: cfgEditor.editorSession,
+      firebaseToken: cfgEditor.editorFirebaseToken,
       appId: cfgEditor.editorAppId,
       appVersion: editorAppVersion(cfgEditor),
       base: cfgEditor.editorBase,
@@ -151,6 +154,18 @@ async function main(argv: string[]): Promise<number> {
 
     if (sub === "discover") {
       print(await session.discover());
+      return 0;
+    }
+    if (sub === "export") {
+      // O .bubble exportado é a referência do formato de design do Bubble —
+      // a entrada do compilador TS → .bubble (Motor 2).
+      const raw = await session.exportDesign();
+      const saved = await writeDesignExport(raw, cfgEditor.exportDir, cfgEditor.editorAppId, editorAppVersion(cfgEditor));
+      if (values.out) {
+        await writeFile(values.out, raw, "utf8");
+        log(`design gravado em ${values.out}`);
+      }
+      print({ ...saved, ...(values.out ? { out: values.out } : {}), head: raw.slice(0, 400) });
       return 0;
     }
     if (sub === "read") {
@@ -199,7 +214,7 @@ async function main(argv: string[]): Promise<number> {
       });
       return 0;
     }
-    throw new Error("uso: bubble-bridge editor discover | read --path P | write --path P --value JSON [--execute]");
+    throw new Error("uso: bubble-bridge editor discover | read --path P | write --path P --value JSON [--execute] | export [--out arq.bubble]");
   }
 
   // Build de elemento não fala com o app: não exige BUBBLE_APP_URL.
@@ -320,6 +335,7 @@ async function main(argv: string[]): Promise<number> {
           const ops = parseEditorOps(cfg.editorOps, (p) => readFileSync(p, "utf8"));
           const session = new BubbleEditorSession({
             session: cfg.editorSession,
+            firebaseToken: cfg.editorFirebaseToken,
             appId: cfg.editorAppId,
             appVersion: editorAppVersion(cfg),
             base: cfg.editorBase,

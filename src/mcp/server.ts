@@ -8,7 +8,7 @@ import { effectiveMode, type ClientIdentity } from "../core/clients.js";
 import { BULK_MAX, BubbleClient, CONSTRAINT_TYPES, MAX_PAGE_LIMIT, apiRootFor } from "../core/client.js";
 import { SENSITIVE_TYPE_RE, probeAnonymous, sweepAnonymous, sweepAnonymousWorkflows } from "../core/recon.js";
 import { fieldIndex, normalizeDesign, typeReferences } from "../core/design.js";
-import { BubbleEditorSession, canonicalJson, parseEditorOps, redactDesignSecrets, shrinkPath, type EditorChange } from "../core/editor.js";
+import { BubbleEditorSession, canonicalJson, diffDesign, parseEditorOps, redactDesignSecrets, shrinkPath, type EditorChange } from "../core/editor.js";
 import {
   assertWritable,
   planId,
@@ -20,7 +20,7 @@ import {
   type WritePlan,
 } from "../core/writes.js";
 import { BubbleApiError } from "../core/errors.js";
-import { exportToNdjson } from "../core/files.js";
+import { exportToNdjson, writeDesignExport } from "../core/files.js";
 import { normalizeSwagger } from "../core/schema.js";
 
 export const SERVER_NAME = "bubble-bridge";
@@ -210,7 +210,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
     return run(tool, target, async () => {
       assertWritable(config, client);
       precheck?.();
-      const pid = planId(tool, client, args);
+      const pid = planId(tool, client, args, identity?.name ?? "local");
       if (control.dry_run) {
         const p: WritePlan = {
           plan_id: pid,
@@ -247,7 +247,11 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
    * Sessão do editor (plano de design). **Falha fechada**: sem cookie de conta
    * e sem app id não existe operação de design — o token da API do app é
    * escopado ao tenant e a plataforma o recusa no plano dela.
+   *
+   * O mapa de operações é lido uma vez e reaproveitado: o JSON inline (ou o
+   * arquivo) não é reparseado a cada chamada.
    */
+  let editorOpsCache: { raw: string | undefined; ops: ReturnType<typeof parseEditorOps> } | undefined;
   function editorSession(): BubbleEditorSession {
     if (!config.editorSession || !config.editorAppId) {
       throw new Error(
@@ -255,13 +259,19 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
           "O token da API do app não alcança o editor: a API dele responde 401.",
       );
     }
-    const ops = parseEditorOps(config.editorOps, (p) => readFileSync(p, "utf8"));
+    if (!editorOpsCache || editorOpsCache.raw !== config.editorOps) {
+      editorOpsCache = {
+        raw: config.editorOps,
+        ops: parseEditorOps(config.editorOps, (p) => readFileSync(p, "utf8")),
+      };
+    }
     return new BubbleEditorSession({
       session: config.editorSession,
+      firebaseToken: config.editorFirebaseToken,
       appId: config.editorAppId,
       appVersion: editorAppVersion(config),
       base: config.editorBase,
-      ops,
+      ops: editorOpsCache.ops,
       http: client.httpOptions,
     });
   }
@@ -400,7 +410,25 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
               if (a.action === "count") {
                 const page = await client.list(a.type, { cursor: 0, limit: 1 });
                 // remaining = restantes APÓS a página devolvida; total = página + restante.
-                return { data: { action: "count", type: a.type, count: page.remaining !== undefined ? page.remaining + page.count : page.count }, items: 1 };
+                const total = page.remaining !== undefined ? page.remaining + page.count : page.count;
+                // Perto do teto de itens por cursor, o Bubble pode contar só até
+                // o teto — o total deixa de ser exato e precisa dizer isso.
+                const capped = total >= config.searchCap;
+                return {
+                  data: {
+                    action: "count",
+                    type: a.type,
+                    count: total,
+                    ...(capped
+                      ? {
+                          capped: true,
+                          capped_at: config.searchCap,
+                          note: `total no teto de ${config.searchCap} itens por cursor — o número real pode ser maior; use bubble_data_export para o tipo inteiro`,
+                        }
+                      : {}),
+                  },
+                  items: 1,
+                };
               }
               if (a.action === "get") {
                 if (!a.id) throw new Error('action=get exige o parâmetro id. Use action=list para descobitr ids.');
@@ -695,6 +723,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                   concurrency: a.concurrency,
                   includeSample: a.include_sample,
                   allowDestructive: a.allow_destructive,
+                  declaredPublic: declared,
                   http: client.httpOptions,
                 });
                 results.push({ ...sweep, apiRoot });
@@ -706,7 +735,13 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                   nota:
                     "exposto = o workflow respondeu sem autenticação (401 do Bubble não apareceu). 400 também conta: o workflow foi " +
                     "alcançado e só faltou payload — que o atacante também tem.",
-                  por_ambiente: results.map((r) => ({ apiRoot: r.apiRoot, sondados: r.probed, expostos: r.exposed })),
+                  por_ambiente: results.map((r) => ({
+                    apiRoot: r.apiRoot,
+                    sondados: r.probed,
+                    expostos: r.exposed,
+                    declarados_publicos: r.declaredPublic.length,
+                  })),
+                  declarados_publicos_no_meta: declared.length,
                   total_expostos: leaks.length,
                   vazamentos: leaks,
                 },
@@ -751,7 +786,51 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                     },
                     proximo_passo:
                       "Leia com bubble_editor_read (paths: [\"pages.AAW\", \"settings\"]) e escreva com bubble_editor_write " +
-                      "(path + value). Nada aqui altera o design.",
+                      "(path + value). Para o design inteiro, use bubble_editor_export (grava o .bubble). " +
+                      "Nada aqui altera o design.",
+                  },
+                  untrusted: false,
+                };
+              }),
+          ),
+      },
+      {
+        name: "bubble_editor_export",
+        minMode: "read-only",
+        localOnly: true,
+        register: (s) =>
+          s.registerTool(
+            "bubble_editor_export",
+            {
+              title: "Exportar o design do app",
+              description:
+                "Exporta o design inteiro do app alvo pelo editor — o mesmo arquivo .bubble do botão Export. " +
+                "Grava em BUBBLE_EXPORT_DIR/design/ e devolve caminho, tamanho e sha256 (não despeja o design no contexto). " +
+                "É a fonte do formato de design que o Bubble aceita — a entrada do compilador TS → .bubble. Só lê.",
+              inputSchema: {
+                head: z
+                  .number()
+                  .int()
+                  .min(0)
+                  .max(4000)
+                  .default(600)
+                  .describe("Quantos caracteres do começo do arquivo devolver (0 = nenhum)"),
+              },
+              annotations: { ...readOnly, readOnlyHint: false, idempotentHint: false }, // grava arquivo local
+            },
+            async ({ head }) =>
+              run("bubble_editor_export", "editor", async () => {
+                const session = editorSession();
+                const raw = await session.exportDesign();
+                const saved = await writeDesignExport(raw, config.exportDir, config.editorAppId!, editorAppVersion(config));
+                return {
+                  data: {
+                    op: "export_design",
+                    app: config.editorAppId,
+                    branch: config.editorBranch,
+                    ...saved,
+                    ...(head > 0 ? { head: raw.slice(0, head) } : {}),
+                    nota: "o .bubble exportado é a referência do formato de design do Bubble — guarde-o versionado",
                   },
                   untrusted: false,
                 };
@@ -1130,9 +1209,12 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                 .default("write_design")
                 .describe("Operação aprovada em BUBBLE_EDITOR_OPS (write_design para editar, publish_design para publicar)"),
               verify: z
-                .enum(["design", "none"])
+                .enum(["design", "schema", "none"])
                 .default("design")
-                .describe("design = relê o nó alterado e compara; none = não confere"),
+                .describe(
+                  "design = relê o nó alterado e compara; schema = relê o contrato de design (/meta) e faz diff " +
+                    "(só confirma depois de publicar o branch); none = não confere",
+                ),
               ...control,
             },
             annotations: { ...writeHints, destructiveHint: true },
@@ -1207,6 +1289,9 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                   };
                 }
                 const antes = verify === "design" ? await currentValue(session, path!).catch(() => undefined) : undefined;
+                // verify=schema: o contrato de design ANTES da escrita.
+                const schemaAntes =
+                  verify === "schema" ? await client.meta().then(normalizeDesign).catch(() => undefined) : undefined;
                 const escrita = await session.writeDesign(changes);
                 if (verify === "none") {
                   return {
@@ -1220,20 +1305,51 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                 const esperado = redactDesignSecrets(
                   changes[0]?.previewValue !== undefined ? changes[0].previewValue : (changes[0]?.value ?? null),
                 );
-                const verificado = apagou
+                const verificadoNoNo = apagou
                   ? antes !== undefined && antes !== null && depois === null
                   : canonicalJson(depois ?? null) === canonicalJson(esperado ?? null);
+
+                // verify=schema: o contrato de design DEPOIS, e o diff entre os dois.
+                let schemaDiff: ReturnType<typeof diffDesign> | undefined;
+                if (verify === "schema") {
+                  const schemaDepois = await client.meta().then(normalizeDesign).catch(() => undefined);
+                  if (schemaAntes && schemaDepois) schemaDiff = diffDesign(schemaAntes, schemaDepois);
+                }
+                const verificado = verify === "schema" ? (schemaDiff?.changed ?? false) : verificadoNoNo;
+
+                const notas: string[] = [];
+                if (verify === "schema") {
+                  notas.push(
+                    schemaDiff?.changed
+                      ? "o contrato de design mudou — a escrita foi aplicada no design publicado."
+                      : "o contrato de design (/meta) não mudou. O /meta reflete apenas o branch publicado: " +
+                        "se a escrita foi no branch de desenvolvimento, o diff só aparece depois de publicar.",
+                  );
+                } else if (!verificadoNoNo) {
+                  notas.push("a releitura não bateu com o que foi escrito — confira no editor antes de reenviar.");
+                }
+
                 return {
                   data: {
                     op,
                     aplicado: true,
                     verificado,
                     resposta: escrita,
-                    antes,
-                    depois,
-                    nota: verificado
-                      ? undefined
-                      : "a releitura não bateu com o que foi escrito — confira no editor antes de reenviar.",
+                    ...(verify === "design" ? { antes, depois } : {}),
+                    ...(schemaDiff
+                      ? {
+                          schema_diff: {
+                            mudou: schemaDiff.changed,
+                            tipos_adicionados: schemaDiff.typesAdded,
+                            tipos_removidos: schemaDiff.typesRemoved,
+                            campos_adicionados: schemaDiff.fieldsAdded,
+                            campos_removidos: schemaDiff.fieldsRemoved,
+                            workflows_adicionados: schemaDiff.workflowsAdded,
+                            workflows_removidos: schemaDiff.workflowsRemoved,
+                          },
+                        }
+                      : {}),
+                    nota: notas.length ? notas.join(" ") : undefined,
                   },
                   items: 1,
                 };

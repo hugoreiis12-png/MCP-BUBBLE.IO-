@@ -39,7 +39,7 @@ node dist/cli.js clients revoke hugo-opencode                  # vale na próxim
 - **Modo efetivo** = o menor entre o modo do client e o `BUBBLE_MODE` da stack, que é o teto do servidor.
 - Uma mudança no arquivo vale sem reiniciar o container. Se o arquivo estiver corrompido, o servidor
   responde 500 e nunca libera acesso.
-- `bubble_data_export` não aparece para client remoto, porque o arquivo seria gravado no disco da VM.
+- `bubble_data_export` e `bubble_editor_export` não aparecem para client remoto, porque o arquivo seria gravado no disco da VM.
 
 ## 3. Conectar os clients
 

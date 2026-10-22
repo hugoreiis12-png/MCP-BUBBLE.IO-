@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig, type Mode } from "../src/config.js";
 import { AuditLog } from "../src/core/audit.js";
 import { BubbleClient } from "../src/core/client.js";
+import type { FetchLike } from "../src/core/http.js";
 import { createBubbleMcpServer, fitToCap, InflightLimiter, MAX_OUTPUT_CHARS } from "../src/mcp/server.js";
 import { fakeBubble, makeRows } from "./fake-bubble.js";
 
@@ -14,7 +15,8 @@ async function connect(
   mode: Mode = "read-only",
   token?: string,
   allowlist?: string,
-  editor?: { session?: string; appId?: string; ops?: string },
+  editor?: { session?: string; appId?: string; ops?: string; firebase?: string; fetch?: FetchLike },
+  extraEnv?: Record<string, string>,
 ) {
   const dir = await mkdtemp(join(tmpdir(), "bb-mcp-"));
   const config = loadConfig({
@@ -27,18 +29,52 @@ async function connect(
     ...(editor?.session ? { BUBBLE_EDITOR_SESSION: editor.session } : {}),
     ...(editor?.appId ? { BUBBLE_EDITOR_APP_ID: editor.appId } : {}),
     ...(editor?.ops ? { BUBBLE_EDITOR_OPS: editor.ops } : {}),
+    ...(editor?.firebase ? { BUBBLE_EDITOR_FIREBASE_TOKEN: editor.firebase } : {}),
+    ...(extraEnv ?? {}),
   });
   const fake = fakeBubble({ pedido: makeRows(250) }, token ? { token } : {});
-  const bubble = new BubbleClient({ appUrl: config.appUrl, env: config.env, token: config.token, fetch: fake.fetch, sleep: async () => undefined });
+  // O editor vive em outro host: a chamada vai para o fetch do editor, o resto para a Data API.
+  const fetchImpl: FetchLike = editor?.fetch
+    ? async (url, init) => (String(url).includes("/api/1.1") ? fake.fetch(url, init) : editor.fetch!(url, init))
+    : fake.fetch;
+  const bubble = new BubbleClient({ appUrl: config.appUrl, env: config.env, token: config.token, fetch: fetchImpl, sleep: async () => undefined });
   const { server, tools } = createBubbleMcpServer({ config, client: bubble, audit: new AuditLog(config.auditLog) });
   const [a, b] = InMemoryTransport.createLinkedPair();
   const mcp = new Client({ name: "teste", version: "0" });
   await Promise.all([server.connect(a), mcp.connect(b)]);
-  return { mcp, tools, dir };
+  return { mcp, tools, dir, fake };
 }
 
 function text(res: Awaited<ReturnType<Client["callTool"]>>): string {
   return (res.content as Array<{ type: string; text: string }>)[0]!.text;
+}
+
+/**
+ * Editor falso: responde às operações /appeditor do editor do Bubble.
+ * `onWrite` roda quando o design é gravado — é o gancho para simular que o
+ * contrato de design (/meta) mudou depois da escrita.
+ */
+function fakeEditor(opts: { onWrite?: () => void } = {}) {
+  const calls: Array<{ method: string; url: string; body?: string }> = [];
+  const fetchImpl: FetchLike = async (url, init) => {
+    calls.push({ method: init?.method ?? "GET", url, body: typeof init?.body === "string" ? init.body : undefined });
+    const path = new URL(url).pathname;
+    if (path.endsWith("/_index")) return jsonRes({ last_change: "9", path_version_hash: "v9" });
+    if (path.endsWith(".bubble")) return new Response('{"pages":{"AAW":{}}}', { status: 200 });
+    if (path === "/appeditor/write") {
+      opts.onWrite?.();
+      return jsonRes({ last_change: "10" });
+    }
+    if (path.startsWith("/appeditor/load_multiple_paths")) {
+      return jsonRes({ last_change: "9", data: [{ data: { valor: 1 } }] });
+    }
+    return jsonRes({ error: "not_found" }, 404);
+  };
+  return { fetchImpl, calls };
+}
+
+function jsonRes(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 describe("servidor MCP", () => {
@@ -96,8 +132,20 @@ describe("servidor MCP", () => {
   it("bubble_query count devolve o total em 1 requisição", async () => {
     const { mcp } = await connect();
     const res = await mcp.callTool({ name: "bubble_query", arguments: { type: "pedido", action: "count" } });
-    const data = res.structuredContent as { count: number };
+    const data = res.structuredContent as { count: number; capped?: boolean };
     expect(data.count).toBe(250);
+    // abaixo do teto: nada é sinalizado
+    expect(data.capped).toBeUndefined();
+  });
+
+  it("bubble_query count sinaliza o teto quando o total bate com BUBBLE_SEARCH_CAP", async () => {
+    const { mcp } = await connect("read-only", undefined, undefined, undefined, { BUBBLE_SEARCH_CAP: "100" });
+    const res = await mcp.callTool({ name: "bubble_query", arguments: { type: "pedido", action: "count" } });
+    const data = res.structuredContent as { count: number; capped?: boolean; capped_at?: number; note?: string };
+    expect(data.count).toBe(250);
+    expect(data.capped).toBe(true);
+    expect(data.capped_at).toBe(100);
+    expect(data.note).toMatch(/teto de 100 itens/);
   });
 
   it("bubble_query get devolve o registro por id; sem id, erro claro", async () => {
@@ -307,5 +355,87 @@ describe("tools de design e de exposição de workflows", () => {
       ops: '{"read_design":{"method":"GET","path":"/wf/load"}}',
     });
     expect(admin.tools).toContain("bubble_editor_write");
+  });
+
+  it("bubble_editor_export grava o .bubble no disco e devolve caminho, bytes e sha256", async () => {
+    const editor = fakeEditor();
+    const { mcp, dir } = await connect("read-only", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "comprover",
+      fetch: editor.fetchImpl,
+    });
+    const res = await mcp.callTool({ name: "bubble_editor_export", arguments: { head: 12 } });
+    const out = res.structuredContent as { file: string; bytes: number; sha256: string; head: string; app: string; branch: string };
+    expect(out.app).toBe("comprover");
+    expect(out.branch).toBe("version-test");
+    expect(out.file.startsWith(join(dir, "exports", "design"))).toBe(true);
+    expect(out.file.endsWith(".bubble")).toBe(true);
+    // o arquivo existe de fato, com o conteúdo que o editor devolveu
+    const conteudo = await readFile(out.file, "utf8");
+    expect(conteudo).toBe('{"pages":{"AAW":{}}}');
+    expect(out.bytes).toBe(Buffer.byteLength(conteudo, "utf8"));
+    expect(out.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(out.head).toBe('{"pages":{"A');
+  });
+
+  it("bubble_editor_write com verify=schema devolve o diff do contrato de design", async () => {
+    // O /meta é do host da Data API; o editor falso só responde /appeditor/*.
+    // O gancho da escrita acrescenta um tipo novo no /meta — é o que o diff vê.
+    const holder: { fake?: ReturnType<typeof fakeBubble> } = {};
+    const editor = fakeEditor({
+      onWrite: () => {
+        holder.fake!.data.novo_tipo = [];
+      },
+    });
+    const { mcp, fake } = await connect("admin", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "app-123",
+      fetch: editor.fetchImpl,
+    });
+    holder.fake = fake;
+
+    const args = { path: "pages.AAW.properties.x", value: { name: "novo" }, verify: "schema" };
+    const dry = await mcp.callTool({ name: "bubble_editor_write", arguments: args });
+    const plano = dry.structuredContent as { plan_id: string };
+    expect(plano.plan_id).toBeTruthy();
+
+    const res = await mcp.callTool({
+      name: "bubble_editor_write",
+      arguments: { ...args, dry_run: false, plan_id: plano.plan_id },
+    });
+    const data = res.structuredContent as {
+      aplicado: boolean;
+      verificado: boolean;
+      schema_diff: { mudou: boolean; tipos_adicionados: string[]; tipos_removidos: string[] };
+      nota: string;
+    };
+    expect(data.aplicado).toBe(true);
+    expect(data.schema_diff.mudou).toBe(true);
+    expect(data.schema_diff.tipos_adicionados).toEqual(["novo_tipo"]);
+    expect(data.schema_diff.tipos_removidos).toEqual([]);
+    expect(data.verificado).toBe(true);
+    expect(data.nota).toMatch(/contrato de design mudou/);
+  });
+
+  it("bubble_editor_write com verify=schema avisa quando o /meta não reflete o branch de desenvolvimento", async () => {
+    // Sem o gancho de escrita, o /meta não muda: o diff fica vazio e a nota
+    // explica que o /meta só reflete o branch publicado.
+    const editor = fakeEditor();
+    const { mcp } = await connect("admin", undefined, undefined, {
+      session: "meta_test_u2main=abc",
+      appId: "app-123",
+      fetch: editor.fetchImpl,
+    });
+    const args = { path: "pages.AAW.properties.x", value: { name: "novo" }, verify: "schema" };
+    const dry = await mcp.callTool({ name: "bubble_editor_write", arguments: args });
+    const plano = dry.structuredContent as { plan_id: string };
+    const res = await mcp.callTool({
+      name: "bubble_editor_write",
+      arguments: { ...args, dry_run: false, plan_id: plano.plan_id },
+    });
+    const data = res.structuredContent as { verificado: boolean; schema_diff: { mudou: boolean }; nota: string };
+    expect(data.schema_diff.mudou).toBe(false);
+    expect(data.verificado).toBe(false);
+    expect(data.nota).toMatch(/branch publicado/);
   });
 });

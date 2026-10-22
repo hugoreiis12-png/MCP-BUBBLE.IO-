@@ -406,6 +406,7 @@ export type EditorOps = Record<string, EditorOp>;
  */
 export const DEFAULT_EDITOR_OPS: EditorOps = {
   read_design: { method: "POST", path: "/appeditor/load_multiple_paths/{app}/{version}" },
+  probe_design: { method: "GET", path: "/appeditor/load_single_path/{app}/{version}/no_version_hash/_index" },
   write_design: { method: "POST", path: "/appeditor/write" },
   export_design: { method: "GET", path: "/appeditor/export/{version}/{app}.bubble" },
   changes: { method: "GET", path: "/appeditor/changes/{app}/{version}/{since}/{session}" },
@@ -433,6 +434,13 @@ export interface EditorChange {
 export interface BubbleEditorSessionOptions {
   /** Cookie de sessão da conta Bubble. Nunca é registrado em log. */
   session: string;
+  /**
+   * JWT do Firebase da conta (`meta-firebase_workflow`).
+   *
+   * O editor exige o cookie **e** este header. Sem o header, a resposta é 401
+   * mesmo com a sessão válida — por isso a credencial é configurável à parte.
+   */
+  firebaseToken?: string;
   /** App alvo — o *appname* (slug) que o editor usa, ex.: `comprover`. */
   appId: string;
   /** Versão do design: `test` (desenvolvimento) ou `live` (publicado). */
@@ -475,16 +483,30 @@ export class BubbleEditorSession {
   readonly appId: string;
   readonly appVersion: string;
   private readonly session: string;
+  private readonly firebaseToken?: string;
   private readonly ops: EditorOps;
   private readonly http: HttpOptions;
 
   constructor(opts: BubbleEditorSessionOptions) {
     this.session = opts.session;
+    this.firebaseToken = opts.firebaseToken;
     this.appId = opts.appId;
     this.appVersion = opts.appVersion;
     this.base = opts.base.replace(/\/+$/, "");
     this.ops = opts.ops ?? DEFAULT_EDITOR_OPS;
     this.http = opts.http ?? {};
+  }
+
+  /**
+   * Headers de credencial do editor.
+   *
+   * São dois: o cookie da sessão e o JWT do Firebase (`meta-firebase_workflow`).
+   * O editor recusa a chamada com 401 se faltar qualquer um dos dois.
+   */
+  private authHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { Cookie: this.session };
+    if (this.firebaseToken) headers["meta-firebase_workflow"] = this.firebaseToken;
+    return headers;
   }
 
   /** O mapa tem a operação pedida? */
@@ -563,10 +585,21 @@ export class BubbleEditorSession {
    * `paths` são caminhos em forma humana (`pages.AAW`, `settings`, `api`).
    * A leitura volta desencolhida, em forma humana, para o agente não precisar
    * conhecer `%p3`/`%nm`.
+   *
+   * `noChunking: false` faz o editor devolver, no lugar dos dados de um nó
+   * grande, apenas a **lista de filhos** (`{keys: [...]}`). É o que a
+   * *descoberta* usa: mapear a raiz sem baixar o nó `api` inteiro (que tem
+   * centenas de workflows no app real).
    */
   async readDesign(
     paths: string[],
-    opts: { expand?: boolean; children?: number; maxChars?: number; secrets?: "mask" | "raw" } = {},
+    opts: {
+      expand?: boolean;
+      children?: number;
+      maxChars?: number;
+      secrets?: "mask" | "raw";
+      noChunking?: boolean;
+    } = {},
   ): Promise<EditorReadResult> {
     const op = this.readOpName();
     if (!op) throw new Error("Nenhuma operação de leitura de design aprovada (BUBBLE_EDITOR_OPS).");
@@ -574,7 +607,7 @@ export class BubbleEditorSession {
     const mask = opts.secrets !== "raw";
     const maxChars = opts.maxChars ?? DEFAULT_MAX_NODE_CHARS;
     const pathArrays = paths.map((p) => shrinkPath(p).split(".").filter(Boolean));
-    const body = { path_arrays: pathArrays, no_chunking: true };
+    const body = { path_arrays: pathArrays, no_chunking: opts.noChunking !== false };
     const raw = (await this.run(op, body, { raw: true })) as {
       last_change?: string;
       data?: Array<{ data?: unknown; keys?: string[] }>;
@@ -603,7 +636,13 @@ export class BubbleEditorSession {
       for (const node of nodes) {
         if (!node.chunkKeys?.length) continue;
         const childPaths = node.chunkKeys.map((k) => `${node.path}.${k}`);
-        const sub = await this.readDesign(childPaths, { expand: expandWanted, children: children - 1, maxChars, secrets: opts.secrets });
+        const sub = await this.readDesign(childPaths, {
+          expand: expandWanted,
+          children: children - 1,
+          maxChars,
+          secrets: opts.secrets,
+          noChunking: opts.noChunking,
+        });
         const byPath = new Map(sub.nodes.map((n) => [n.path, n]));
         const merged: Record<string, unknown> = {};
         for (const key of node.chunkKeys) {
@@ -620,7 +659,13 @@ export class BubbleEditorSession {
   /** Lê um nó do design. */
   async readNode(
     path: string,
-    opts: { expand?: boolean; children?: number; maxChars?: number; secrets?: "mask" | "raw" } = {},
+    opts: {
+      expand?: boolean;
+      children?: number;
+      maxChars?: number;
+      secrets?: "mask" | "raw";
+      noChunking?: boolean;
+    } = {},
   ): Promise<EditorNode> {
     const res = await this.readDesign([path], opts);
     return res.nodes[0]!;
@@ -733,12 +778,27 @@ export class BubbleEditorSession {
   /**
    * Sonda leve: a sessão da conta responde?
    * Usado pelo `doctor` para dizer se a credencial de conta ainda vale.
+   *
+   * A URL vem do **mapa de operações aprovado** (`probe_design` no padrão);
+   * quando o mapa não tiver uma operação de sondagem, a sonda usa a própria
+   * operação de leitura com um caminho trivial. Nenhuma URL é adivinhada.
    */
   async probe(): Promise<{ reachable: boolean; status?: number; error?: string; lastChange?: string; pathVersionHash?: string }> {
+    const op = this.probeOpName();
+    if (!op) {
+      return { reachable: false, error: "nenhuma operação de sondagem aprovada no mapa (BUBBLE_EDITOR_OPS)" };
+    }
     try {
+      const spec = this.ops[op]!;
       const raw = (await requestJson(
-        `${this.base}/appeditor/load_single_path/${encodeURIComponent(this.appId)}/${encodeURIComponent(this.appVersion)}/no_version_hash/_index`,
-        { method: "GET", headers: { Cookie: this.session } },
+        this.resolveUrl(spec),
+        {
+          method: spec.method,
+          // A sondagem só manda corpo quando a operação de leitura é um POST
+          // (no mapa padrão). GET não leva corpo.
+          body: op === this.readOpName() && spec.method !== "GET" ? { path_arrays: [["_index"]], no_chunking: true } : undefined,
+          headers: this.authHeaders(),
+        },
         this.http,
       )) as { last_change?: string; path_version_hash?: string };
       return { reachable: true, status: 200, lastChange: raw.last_change, pathVersionHash: raw.path_version_hash };
@@ -749,6 +809,19 @@ export class BubbleEditorSession {
         error: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+
+  /**
+   * Nome da operação de sondagem, se houver uma aprovada.
+   *
+   * `probe_design` no mapa padrão; senão, qualquer operação cujo nome ou
+   * caminho case com sondagem. Sem nenhuma, a sonda cai na operação de leitura.
+   */
+  private probeOpName(): string | undefined {
+    if (this.ops.probe_design) return "probe_design";
+    const named = this.opNames().find((n) => /probe|ping|health|session|load_single/i.test(n));
+    if (named) return named;
+    return this.readOpName();
   }
 
   /**
@@ -799,8 +872,12 @@ export class BubbleEditorSession {
 
     // Raiz do design, em forma encolhida: %p3=pages, %ed=element_definitions,
     // %wf=api(workflows), %p=properties, %x=type...
+    //
+    // `noChunking: false` é o ponto: o editor devolve a LISTA de filhos de um nó
+    // grande em vez dos dados. Sem isso, mapear a raiz baixaria o nó `api`
+    // inteiro (centenas de workflows) — vários MB por chamada.
     const roots = ["pages", "element_definitions", "api", "styles", "user_types", "option_sets", "mobile_views", "settings", "global_expressions"];
-    const res = await this.readDesign(roots);
+    const res = await this.readDesign(roots, { noChunking: false });
     for (const node of res.nodes) {
       out.roots.push({ path: node.path, children: node.chunkKeys?.length });
     }
@@ -827,7 +904,7 @@ export class BubbleEditorSession {
         method: spec.method,
         body: spec.method === "GET" || body === undefined ? undefined : body,
         responseType: opts.text ? "text" : "json",
-        headers: { Cookie: this.session },
+        headers: this.authHeaders(),
       }, this.http);
       return res;
     } catch (err) {

@@ -45,6 +45,13 @@ describe("registro de clients", () => {
     expect(() => registry.authenticate(token)).toThrow();
   });
 
+  it("arquivo corrompido diz o que houve, não um SyntaxError cru", async () => {
+    await writeFile(file, "{quebrado");
+    expect(() => new ClientRegistry(file).activeCount()).toThrow(/ilegível/);
+    await writeFile(file, JSON.stringify({ clients: [{ name: "x" }] }));
+    expect(() => new ClientRegistry(file).activeCount()).toThrow(/inválido/);
+  });
+
   it("modo efetivo nunca passa do servidor", () => {
     expect(effectiveMode("admin", "read-write")).toBe("read-write");
     expect(effectiveMode("read-only", "admin")).toBe("read-only");
@@ -112,6 +119,27 @@ describe("HTTP com token por client", () => {
     expect((await rpc(url, token, "tools/list")).status).toBe(200);
     revokeClient(file, "temp");
     expect((await rpc(url, token, "tools/list")).status).toBe(401);
+  });
+
+  it("plan_id emitido para um client não é executável por outro", async () => {
+    const a = addClient(file, "a", "read-write");
+    const b = addClient(file, "b", "read-write");
+    const url = await start("read-write");
+    const dry = await rpc(url, a, "tools/call", {
+      name: "bubble_data_create",
+      arguments: { type: "pedido", fields: { n: 1 } },
+    });
+    const dryBody = (await dry.json()) as { result: { structuredContent: { plan_id: string } } };
+    const planId = dryBody.result.structuredContent.plan_id;
+    expect(planId).toBeTruthy();
+
+    const exec = await rpc(url, b, "tools/call", {
+      name: "bubble_data_create",
+      arguments: { type: "pedido", fields: { n: 1 }, dry_run: false, plan_id: planId },
+    });
+    const execBody = (await exec.json()) as { result: { isError: boolean; content: Array<{ text: string }> } };
+    expect(execBody.result.isError).toBe(true);
+    expect(execBody.result.content[0]!.text).toMatch(/outro client/);
   });
 
   it("auditoria registra o nome do client e nunca o token", async () => {

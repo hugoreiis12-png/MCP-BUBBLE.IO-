@@ -57,7 +57,17 @@ export function staticTokenAuth(token: string, mode: Mode): Authenticator {
 
 export function readClients(path: string): ClientRecord[] {
   if (!existsSync(path)) return [];
-  const parsed = ClientsFileSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    // Arquivo corrompido nunca libera acesso: a requisição vira 500 com a causa.
+    throw new Error(
+      `Arquivo de clients ilegível (${path}): ${err instanceof Error ? err.message : String(err)}. ` +
+        "Rode `clients list` para conferir o formato { \"clients\": [ ... ] }.",
+    );
+  }
+  const parsed = ClientsFileSchema.safeParse(raw);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `- ${i.path.join(".")}: ${i.message}`).join("\n");
     throw new Error(`Arquivo de clients inválido (${path}):\n${issues}`);

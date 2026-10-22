@@ -5,7 +5,8 @@ Servidor MCP + CLI em Node/TypeScript que liga o OpenCode (ou Claude Code) a um 
 - **Motor 1 — runtime:** leitura e escrita no banco e execução de backend workflows pela Data API e Workflow API, com guardas de escrita.
 - **Motor 3 — elementos:** compila componentes TS/React para os arquivos de um elemento de plugin, prontos para o sync com o GitHub.
 
-O Motor 2 (compilador TS → `.bubble`) depende da PoC-0, que precisa de um export real do app.
+O Motor 2 (compilador TS → `.bubble`) depende da PoC-0: o export real do app. O Bridge já
+baixa esse `.bubble` (`editor export` / `bubble_editor_export`) — falta o compilador.
 
 ## Arquitetura
 
@@ -44,11 +45,17 @@ No editor do Bubble (Settings > API): habilite a Data API para os tipos desejado
 | `BUBBLE_WORKFLOW_ALLOWLIST` | vazio | Workflows que `bubble_workflow_run` pode disparar (lista separada por vírgula) |
 | `BUBBLE_AUDIT_LOG` | desligado | Log JSONL de cada chamada (sem token e sem payload) |
 | `BUBBLE_EXPORT_DIR` | `./exports` | Exportações e snapshots de registros apagados |
+| `BUBBLE_MAX_RETRIES` | `4` | Tentativas extras em requisições idempotentes (GET) |
+| `BUBBLE_TIMEOUT_MS` | `30000` | Timeout de cada requisição HTTP |
+| `BUBBLE_SEARCH_CAP` | `50000` | Teto de itens por cursor num GET (acima disso o total pode vir truncado — o `count` sinaliza com `capped`) |
 | `BUBBLE_EDITOR_SESSION` | vazio | Cookie da sessão da conta Bubble (ex.: `meta_test_u2main=…`). Sem ele, as tools de editor não são registradas |
+| `BUBBLE_EDITOR_FIREBASE_TOKEN` | vazio | JWT do Firebase da conta (header `meta-firebase_workflow`). O editor exige o cookie **e** este header; sem ele a escrita devolve 401 |
 | `BUBBLE_EDITOR_APP_ID` | vazio | Id do app no editor Bubble |
 | `BUBBLE_EDITOR_BRANCH` | `version-test` | `version-test` (dev) ou `version-live` (publicado) |
-| `BUBBLE_EDITOR_API_BASE` | `https://editor.bubbleapps.io/version-test/api/1.1/` | Base da API interna do editor |
+| `BUBBLE_EDITOR_BASE` | `https://scheduled.bubble.io` | Base HTTP do editor (o host de `/appeditor/*`, diferente do host da API do app) |
 | `BUBBLE_EDITOR_OPS` | vazio | Mapa JSON `{op: {method, path}}` das operações de design que o operador autoriza |
+
+> `BUBBLE_EDITOR_API_BASE` foi renomeado para `BUBBLE_EDITOR_BASE`. A variável antiga ainda é lida como *fallback*, mas não deve mais ser usada.
 
 ## Tools MCP
 
@@ -71,9 +78,12 @@ No editor do Bubble (Settings > API): habilite a Data API para os tipos desejado
 | `bubble_workflow_exposure_audit` | read-only | Workflows **públicos**: `declared` (só `/meta`, zero escrita) ou `active` (POST anônimo, ignora nomes destrutivos) |
 | `bubble_editor_discover` | read-only | Schema do app interno do editor → operações candidatas a ler/escrever design |
 | `bubble_editor_read` | read-only | Documento de design cru, via uma operação aprovada em `BUBBLE_EDITOR_OPS` |
+| `bubble_editor_export` | read-only | Exporta o design inteiro (`.bubble`) para `BUBBLE_EXPORT_DIR/design/` — devolve caminho, bytes e sha256 |
 | `bubble_editor_write` | admin | Escreve design via operação aprovada; `dry_run` + `plan_id`; `verify=design\|schema\|none` |
 
 Respostas valem `structuredContent` + texto compacto; **teto de 16 KB por resposta** (arrays grandes são cortados e marcados `_truncated`) e **fila de 6 chamadas em voo** para não rajada na Data API. As tools `bubble_data_query`, `bubble_data_get` e `bubble_schema_discover` da v0.2 foram substituídas por `bubble_query` e `bubble_schema`.
+
+`bubble_data_export` e `bubble_editor_export` **gravam arquivo no disco do servidor** — por isso não são `readOnlyHint` e não são oferecidas a clients remotos (transporte HTTP).
 
 ### Como uma escrita acontece
 
@@ -195,9 +205,25 @@ alcança **todos os apps que a conta puder editar**, ela:
 - só registra `bubble_editor_write` no modo `admin`;
 - exige `BUBBLE_ALLOW_LIVE_WRITES=true` para tocar no branch publicado.
 
+O editor exige **o cookie e o header do Firebase** (`BUBBLE_EDITOR_FIREBASE_TOKEN`,
+`meta-firebase_workflow`): com o cookie válido e sem o header, a chamada volta 401 —
+é o motivo mais comum de a escrita de design falhar.
+
 As operações executadas não são adivinhadas: `BUBBLE_EDITOR_OPS` é um mapa que o
 operador aprova (`{op: {method, path}}`), e `bubble_editor_discover` mostra as
 candidatas para montá-lo.
+
+**Export do design (a entrada do Motor 2):** o `.bubble` que o editor exporta é a
+única fonte que descreve o formato de design que o Bubble aceita. O Bridge baixa
+esse arquivo, grava em `BUBBLE_EXPORT_DIR/design/` e devolve caminho, tamanho e
+sha256 — o design não é despejado no contexto.
+
+```bash
+node dist/cli.js editor export                 # grava em $BUBBLE_EXPORT_DIR/design/
+node dist/cli.js editor export --out app.bubble # e também num caminho escolhido
+```
+
+Via MCP: `bubble_editor_export` (mesma coisa, com `head` para olhar o começo).
 
 **Deploy tem trava própria:** no Bubble, publicar o branch `version-test` já é um
 deploy do app público. Então uma operação de publish/deploy exige
@@ -239,7 +265,7 @@ node dist/cli.js serve --http --port 8787             # bind 127.0.0.1 por padr�
 ## Testes
 
 ```bash
-npm test           # 142 testes: http, cliente, export, escrita, MCP, design, editor, build e runtime de elementos em jsdom
+npm test           # 167 testes: http, cliente, export, escrita, MCP, design, editor, build e runtime de elementos em jsdom
 npm run typecheck  # código, testes e elementos
 ```
 
@@ -247,9 +273,9 @@ npm run typecheck  # código, testes e elementos
 
 - [ ] Escrita: rodar `create` → `update` → `delete` num tipo de teste em `version-test`.
 - [ ] `/bulk`: confirmar o formato de resposta por linha com um item inválido no lote.
-- [ ] Design: `bubble_editor_write` end-to-end contra o app real (falta o cookie da conta e o mapa `BUBBLE_EDITOR_OPS`).
-- [ ] Design: quais operações do `editor.bubbleapps.io` leem e salvam o documento de design — `bubble_editor_discover` responde isso, mas nunca foi rodado com sessão válida.
-- [ ] Design: `verify=schema` só confirma depois de publicar o branch; falta o teste real desse ciclo.
+- [ ] Design: `bubble_editor_write` end-to-end contra o app real (falta o cookie da conta, o JWT do Firebase e o mapa `BUBBLE_EDITOR_OPS`).
+- [ ] Design: `editor export` / `bubble_editor_export` contra o app real — o arquivo `.bubble` que sair daí é a referência do formato para o Motor 2.
+- [ ] Design: `verify=schema` só confirma depois de publicar o branch; falta o teste real desse ciclo (o código está pronto, o teste é contra o app).
 - [ ] Elemento: sync do `contador` num plugin real, uso numa página, e conferir se estados e eventos aparecem no editor com os nomes do código.
 - [ ] Formato de estados e eventos no `params.json` depois do sync — o build hoje só avisa que não consegue confirmar. Se você me mandar esse arquivo, a checagem passa a ser estrita.
 - [ ] Tamanho do `headers.html`: o bundle com React 19 tem cerca de 220 KB por elemento. Se o Bubble limitar headers ou vários elementos pesarem, o próximo passo é um React compartilhado no header do plugin, ou Preact.
