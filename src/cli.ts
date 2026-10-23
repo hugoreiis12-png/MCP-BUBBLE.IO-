@@ -7,7 +7,7 @@ import { AuditLog } from "./core/audit.js";
 import { BubbleClient, type Constraint } from "./core/client.js";
 import { generateTypes } from "./core/codegen.js";
 import { exportToNdjson, writeDesignExport } from "./core/files.js";
-import { normalizeSwagger } from "./core/schema.js";
+import { normalizeSwagger, type NormalizedSchema } from "./core/schema.js";
 import { createBubbleMcpServer, SERVER_VERSION } from "./mcp/server.js";
 import { runClients } from "./cli-clients.js";
 
@@ -27,6 +27,10 @@ Comandos
                                 Compila um elemento React para os arquivos do Plugin Editor
   exposure [--type T] [--live]   PoC: lê um tipo SEM token e diz se está exposto
   exposure [--all] [--live]     Varre a Data API sem token e classifica a gravidade
+  page deploy <arquivo.html>    Envio do padrão "páginas locais como dado": o app guarda o HTML
+                                num data type e renderiza com expressão dinâmica. Padrao:
+                                --type paginas, chave --key-field pagina, corpo --html-field html.
+                                Slug vem do nome do arquivo (ou --slug). Sem --execute é dry-run.
   design [--type T]             Contrato de design do app (/meta): tipos, ids internos, workflows
   editor discover               Sonda o editor: sessão, versão do design e nós da raiz
   editor read --path P          Lê um nó do design (--children N desce N níveis)
@@ -114,6 +118,9 @@ async function main(argv: string[]): Promise<number> {
       concurrency: { type: "string" },
       mode: { type: "string" },
       file: { type: "string" },
+      slug: { type: "string" },
+      "key-field": { type: "string" },
+      "html-field": { type: "string" },
       path: { type: "string" },
       value: { type: "string" },
       children: { type: "string" },
@@ -238,10 +245,40 @@ async function main(argv: string[]): Promise<number> {
     });
     return 0;
   }
-  if (positionals.length) throw new Error(`argumento inesperado: ${positionals[0]}`);
+  if (positionals.length && command !== "page") throw new Error(`argumento inesperado: ${positionals[0]}`);
 
   const cfg = loadConfig();
   const client = makeClient(cfg);
+
+  // Deploy de página local (padrão "páginas como dado"): fala com o app,
+  // então precisa de BUBBLE_APP_URL — como query/export, e de modo com escrita.
+  if (command === "page") {
+    const sub = positionals[0] ?? "";
+    if (sub !== "deploy") throw new Error("uso: bubble-bridge page deploy <arquivo.html> [--slug S] [--type T] [--key-field pagina] [--html-field html] [--execute]");
+    const file = positionals[1];
+    if (!file) throw new Error("faltou o arquivo HTML (uso: page deploy <arquivo.html>)");
+    if (positionals.length > 2) throw new Error(`argumento inesperado: ${positionals[2]}`);
+    const { deployPage, slugFromFile, PAGE_DEFAULT_TYPE, PAGE_DEFAULT_KEY_FIELD, PAGE_DEFAULT_HTML_FIELD } = await import("./core/pages.js");
+    // Contrato validável contra o swagger quando o app publica; sem
+    // swagger o deploy segue com aviso (mesma postura fail-safe do resto da ferramenta).
+    let schema: NormalizedSchema | undefined;
+    try {
+      schema = normalizeSwagger(await client.swagger());
+    } catch {
+      schema = undefined;
+    }
+    const result = await deployPage(cfg, client, {
+      file,
+      type: values.type ?? PAGE_DEFAULT_TYPE,
+      keyField: values["key-field"] ?? PAGE_DEFAULT_KEY_FIELD,
+      htmlField: values["html-field"] ?? PAGE_DEFAULT_HTML_FIELD,
+      slug: values.slug ?? slugFromFile(file),
+      schema,
+      execute: values.execute,
+    });
+    print(result);
+    return 0;
+  }
 
   switch (command) {
     case "serve": {

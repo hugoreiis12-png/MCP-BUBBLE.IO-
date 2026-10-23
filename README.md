@@ -93,6 +93,41 @@ Respostas valem `structuredContent` + texto compacto; **teto de 16 KB por respos
 
 A aprovação humana fica no cliente MCP: mantenha as tools de escrita exigindo confirmação no OpenCode ou no Claude Code.
 
+## Páginas locais como dado (Motor 2 alternativo)
+
+Inspirado no padrão do [vibecoding_to_bubble](https://github.com/manoelnetodev/vibecoding_to_bubble)
+(integrado em 10/2026): em vez de compilar design, o HTML/JS/CSS da interface vive em
+**arquivos locais** e o app Bubble guarda cada página como **registro** de um data type,
+renderizando com expressão dinâmica
+(`Do a search for paginas where pagina = "dashboard" → first item's html`).
+
+Setup no app, uma vez:
+
+1. Data > Data types: tipo `paginas` (ou nome próprio via `--type`) com campos `pagina`
+   (chave) e `html` (conteúdo com CSS/JS inline).
+2. Settings > API: habilite o tipo e **exponha os campos** — o deploy valida o contrato
+   contra o swagger e recusa se o tipo não estiver na Data API.
+3. Na página Bubble, um elemento HTML cujo conteúdo busca o registro pela chave.
+
+Deploy de uma página:
+
+```bash
+node dist/cli.js page deploy pages/dashboard.html            # dry-run: mostra o plano
+node dist/cli.js page deploy pages/dashboard.html --execute  # cria ou atualiza
+node dist/cli.js page deploy pages/dashboard.html --slug dashboard --key-field pagina --type paginas --execute
+```
+
+- Slug padrão vem do nome do arquivo (`Minha Página 2.html` → `minha-pagina-2`); o registro
+  é encontrado pela chave e **atualizado**, não duplicado (chave repetida no app avisa e
+  atualiza a primeira).
+- Guardas herdadas do bridge: dry-run padrão no CLI (`--execute` para aplicar) e trava de
+  live (`BUBBLE_ALLOW_LIVE_WRITES`).
+- Pelo MCP: tool `bubble_page_deploy` (modo `read-write`), com `html` (conteúdo, não caminho, para
+  funcionar em client remoto), `slug` e, opcionalmente, `type`, `key_field` e `html_field`. Segue o
+  fluxo das outras escritas: dry-run devolve o `plan_id`, e executar exige o mesmo `plan_id`.
+- Sem coordenação com o compilador TS → `.bubble`: é um caminho paralelo e mais simples
+  para apps cuja UI dispensa elementos nativos do Bubble.
+
 ## Elementos de plugin (Motor 3)
 
 Fluxo de uma vez por elemento:

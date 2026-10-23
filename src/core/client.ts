@@ -1,6 +1,7 @@
 import type { BubbleEnv } from "../config.js";
 import { requestJson, type HttpOptions } from "./http.js";
 
+
 /** Tipos de constraint aceitos pela Data API (manual: Data API requests). */
 export const CONSTRAINT_TYPES = [
   "equals",

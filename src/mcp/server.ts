@@ -21,7 +21,14 @@ import {
 } from "../core/writes.js";
 import { BubbleApiError } from "../core/errors.js";
 import { exportToNdjson, writeDesignExport } from "../core/files.js";
-import { normalizeSwagger } from "../core/schema.js";
+import { normalizeSwagger, type NormalizedSchema } from "../core/schema.js";
+import {
+  applyPageDeploy,
+  PAGE_DEFAULT_HTML_FIELD,
+  PAGE_DEFAULT_KEY_FIELD,
+  PAGE_DEFAULT_TYPE,
+  resolvePageDeploy,
+} from "../core/pages.js";
 
 export const SERVER_NAME = "bubble-bridge";
 export const SERVER_VERSION = "0.4.0";
@@ -133,6 +140,14 @@ export interface ServerDeps {
   identity?: ClientIdentity;
 }
 
+/** O que o dry-run mostra antes de uma escrita. */
+interface PlanInput {
+  method: string;
+  endpoint: string;
+  summary: string;
+  payload?: unknown;
+}
+
 interface ToolSpec {
   name: string;
   minMode: Mode;
@@ -158,6 +173,15 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
   }
 
   /** Cache de 60 s do /meta: contrato de design (~850 KB) lido pelas tools de design. */
+  /** Contrato para o deploy de página; sem swagger segue com aviso, como na CLI. */
+  async function pageSchema(): Promise<NormalizedSchema | undefined> {
+    try {
+      return normalizeSwagger(await swaggerCached());
+    } catch {
+      return undefined;
+    }
+  }
+
   async function metaCached(): Promise<unknown> {
     if (meta.value && Date.now() - meta.at < SWAGGER_TTL_MS) return meta.value;
     meta.value = await client.meta();
@@ -203,7 +227,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
     target: string,
     args: Record<string, unknown>,
     control: { dry_run: boolean; plan_id?: string },
-    plan: { method: string; endpoint: string; summary: string; payload?: unknown },
+    planInput: PlanInput | (() => Promise<PlanInput>),
     exec: () => Promise<{ data: unknown; items?: number }>,
     precheck?: () => void,
   ): Promise<CallToolResult> {
@@ -212,6 +236,7 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
       precheck?.();
       const pid = planId(tool, client, args, identity?.name ?? "local");
       if (control.dry_run) {
+        const plan = typeof planInput === "function" ? await planInput() : planInput;
         const p: WritePlan = {
           plan_id: pid,
           tool,
@@ -1001,6 +1026,58 @@ export function createBubbleMcpServer(deps: ServerDeps): { server: McpServer; to
                 return { data: { updated_id: id, fields: Object.keys(fields) }, items: 1 };
               },
             ),
+        ),
+    },
+    {
+      name: "bubble_page_deploy",
+      minMode: "read-write",
+      register: (s) =>
+        s.registerTool(
+          "bubble_page_deploy",
+          {
+            title: "Publicar página HTML como dado",
+            description:
+              "Padrão \"páginas como dado\": grava o HTML completo de uma página (CSS e JS inline) num registro do app, " +
+              "que a renderiza num elemento HTML com expressão dinâmica (Do a search for paginas where pagina = slug → html). " +
+              "Busca o registro pela chave e atualiza; sem registro, cria. Valida o tipo e os campos no swagger antes. " +
+              "Começa em dry-run; executar exige o plan_id do dry-run.",
+            inputSchema: {
+              html: z.string().min(1).describe("Conteúdo HTML completo da página"),
+              slug: z.string().min(1).describe("Valor da chave que identifica a página no app (ex.: dashboard)"),
+              type: z.string().min(1).default(PAGE_DEFAULT_TYPE).describe("Data type que guarda as páginas"),
+              key_field: z.string().min(1).default(PAGE_DEFAULT_KEY_FIELD).describe("Campo chave (recebe o slug)"),
+              html_field: z.string().min(1).default(PAGE_DEFAULT_HTML_FIELD).describe("Campo que recebe o HTML"),
+              ...control,
+            },
+            annotations: { ...writeHints, idempotentHint: true },
+          },
+          async ({ html, slug, type, key_field, html_field, dry_run, plan_id }) => {
+            const page = { type, keyField: key_field, htmlField: html_field, slug };
+            const bytes = Buffer.byteLength(html, "utf8");
+            const resolveTarget = async () => resolvePageDeploy(client, { ...page, schema: await pageSchema() });
+            return write(
+              "bubble_page_deploy",
+              type,
+              { html, slug, type, key_field, html_field },
+              { dry_run, plan_id },
+              async () => {
+                const target = await resolveTarget();
+                const verb = target.action === "create" ? "Criar" : `Atualizar o registro ${target.id} da`;
+                return {
+                  method: target.method,
+                  endpoint: target.endpoint,
+                  summary: `${verb} página "${slug}" em "${type}" (${bytes} bytes)${target.warnings.length ? ` — avisos: ${target.warnings.join("; ")}` : ""}`,
+                  payload: { [key_field]: slug, [html_field]: `<${bytes} bytes de HTML>` },
+                };
+              },
+              async () => {
+                // Re-resolve na execução: o registro pode ter sido criado entre o dry-run e agora.
+                const target = await resolveTarget();
+                const id = await applyPageDeploy(client, page, target, html);
+                return { data: { action: target.action, id, slug, type, html_bytes: bytes, warnings: target.warnings }, items: 1 };
+              },
+            );
+          },
         ),
     },
     {

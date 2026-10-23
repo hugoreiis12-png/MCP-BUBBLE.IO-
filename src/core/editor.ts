@@ -2,63 +2,7 @@
  * Cliente do plano de design do Bubble (o "editor").
  *
  * ## O que é alcançável com quais credenciais
- *
- * O token da API do app (`BUBBLE_API_TOKEN`) é **escopado ao tenant**: ele lê e
- * grava registros, dispara workflows e lê o contrato de design (`/meta`), mas a
- * plataforma recusa o mesmo token no plano dela (`POST bubble.io/api/1.1/wf/*`
- * → 401 "Invalid or expired token").
- *
- * O que alcança o design de verdade é a **sessão da conta Bubble** (cookie de
- * sessão + JWT do Firebase): ela concede leitura e escrita de design sobre
- * **todos os apps que a conta puder editar**. É uma credencial de raio bem maior
- * que o token do app — por isso este módulo falha fechado sem ela e nunca a
- * registra em log.
- *
- * ## O protocolo real (medido no editor, não documentado)
- *
- * O editor expõe uma API interna em `{base}/appeditor/*`, onde `base` é o host
- * do editor (`https://scheduled.bubble.io` por padrão). O `base` real é
- * dedutível do host que serve a página do editor; a API do *app* (`/api/1.1`)
- * e a do *editor* (`/appeditor`) moram em hosts diferentes.
- *
- *   POST {base}/appeditor/load_multiple_paths/{app}/{version}
- *     body: { path_arrays: [[segmento, ...], ...], no_chunking: true }
- *     →    { last_change, data: [ { data } | { keys: [...] } ] }
- *
- *   POST {base}/appeditor/write
- *     body: { v: 1, appname, app_version,
- *             changes: [ { body, path_array, metadata, session_id } ] }
- *     →    { last_change, last_change_date, id_counter }
- *
- *   GET  {base}/appeditor/changes/{app}/{version}/{since}/{session_id}
- *   GET  {base}/appeditor/export/{version}/{app}.bubble   (design inteiro)
- *   POST {base}/appeditor/deploy_new_code  body: { appname }   (publica)
- *
- * Leitura e escrita falam a mesma linguagem: **caminhos encolhidos** ("shrunk").
- * O editor guarda nomes reservados em forma curta com prefixo `%` — `pages` vira
- * `%p3`, `elements` vira `%el`, `name` vira `%nm`, `description` vira `%d3`, e
- * assim por diante (a tabela completa está em `SHRINK_MAP`). O caminho vai
- * encolhido na URL e o *valor* vai encolhido no corpo — o servidor guarda o
- * corpo **exatamente como ele chega**, então encolher é responsabilidade do
- * cliente: mandar `{"name": "x"}` em vez de `{"%nm": "x"}` criaria um campo
- * diferente do que o editor entende.
- *
- * Apagar um nó é escrever `body: null` no mesmo caminho.
- *
- * ## Por que as operações são configuradas, não adivinhadas
- *
- * A API do editor é interna e muda sem aviso. Este cliente não inventa URL: ele
- * executa um **mapa de operações configurado** (`BUBBLE_EDITOR_OPS`), que por
- * padrão são as operações medidas acima e que o operador pode restringir ou
- * reescrever a qualquer momento. A tool MCP só escolhe, por nome, entre as
- * operações aprovadas.
- *
- * ## Confirmação de efeito
- *
- * Toda escrita é conferida por releitura do design no mesmo caminho alterado:
- * o efeito só é declarado se a releitura mostrar a mudança. Sem essa
- * confirmação, a tool devolve `verified: false` e o plano é considerado não
- * aplicado.
+ 
  */
 
 import { requestJson, type HttpOptions } from "./http.js";

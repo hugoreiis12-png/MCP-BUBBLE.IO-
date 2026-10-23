@@ -78,6 +78,42 @@ function jsonRes(body: unknown, status = 200): Response {
 }
 
 describe("servidor MCP", () => {
+  it("bubble_page_deploy não existe em read-only", async () => {
+    const { tools } = await connect("read-only");
+    expect(tools).not.toContain("bubble_page_deploy");
+  });
+
+  it("bubble_page_deploy recusa quando o tipo não está na Data API, sem escrever", async () => {
+    const { mcp, fake } = await connect("read-write");
+    const res = await mcp.callTool({ name: "bubble_page_deploy", arguments: { html: "<h1>oi</h1>", slug: "dashboard" } });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/tipo "paginas" não está exposto/);
+    expect(fake.writes).toHaveLength(0);
+  });
+
+  it("bubble_page_deploy: dry-run mostra o plano sem o HTML; execução com plan_id cria o registro", async () => {
+    const { mcp, fake } = await connect("read-write");
+    // A fixture não tem `paginas`: `pedido` com campos existentes faz o papel do tipo de páginas.
+    const args = { html: "<h1>dashboard</h1>", slug: "dashboard", type: "pedido", key_field: "cliente", html_field: "tags" };
+    const dry = await mcp.callTool({ name: "bubble_page_deploy", arguments: args });
+    const plano = dry.structuredContent as { plan_id: string; method: string; summary: string; payload_preview: Record<string, unknown> };
+    expect(plano.method).toBe("POST");
+    expect(plano.summary).toMatch(/PATCH por id não está exposto/);
+    expect(plano.payload_preview).toEqual({ cliente: "dashboard", tags: "<18 bytes de HTML>" });
+    expect(fake.writes).toHaveLength(0);
+
+    const outro = await mcp.callTool({ name: "bubble_page_deploy", arguments: { ...args, html: "<h1>outro</h1>", dry_run: false, plan_id: plano.plan_id } });
+    expect(outro.isError).toBe(true);
+    expect(fake.writes).toHaveLength(0);
+
+    const res = await mcp.callTool({ name: "bubble_page_deploy", arguments: { ...args, dry_run: false, plan_id: plano.plan_id } });
+    const data = res.structuredContent as { action: string; id: string; html_bytes: number };
+    expect(data.action).toBe("create");
+    expect(data.id).toMatch(/^new/);
+    expect(fake.writes).toHaveLength(1);
+    expect(JSON.parse(fake.writes[0]!.body!)).toEqual({ cliente: "dashboard", tags: "<h1>dashboard</h1>" });
+  });
+
   it("registra só tools de leitura; só o export (grava arquivo) não é readOnlyHint", async () => {
     const { mcp } = await connect();
     const { tools } = await mcp.listTools();
